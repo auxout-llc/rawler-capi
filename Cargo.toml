@@ -1,0 +1,24 @@
+[package]
+name = "rawler_capi"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1"
+description = "A plain C ABI over rawler (dnglab): decode camera RAW files, metadata, demosaic primitives"
+publish = false
+
+[lib]
+name = "rawler_capi"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Pinned upstream commit (2026-10-30). crates.io 0.8.0 lacks the APIs used here.
+rawler = { git = "https://github.com/dnglab/dnglab", rev = "1fcc4a5607591178d2b335845a7e5ee09f89a37f", default-features = true }
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = "symbols"
+panic = "unwind"
