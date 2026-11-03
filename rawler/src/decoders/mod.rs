@@ -390,6 +390,34 @@ pub trait Decoder: Send {
   fn format_hint(&self) -> FormatHint;
 }
 
+/// AUXOUT: rotation in degrees, as Canon CIFF (ImageInfo) and Leaf (ImgProf_rotation_angle)
+/// record it, to the EXIF orientation value. Same mapping as dcraw / LibRaw: 90 is a
+/// clockwise turn for display (6), 270 counter-clockwise (8).
+pub(crate) fn exif_orientation_from_degrees(degrees: i32) -> Option<u16> {
+  match degrees.rem_euclid(360) {
+    0 => Some(1),
+    90 => Some(6),
+    180 => Some(3),
+    270 => Some(8),
+    _ => None,
+  }
+}
+
+#[cfg(test)]
+mod auxout_orientation_tests {
+  use super::exif_orientation_from_degrees;
+
+  #[test]
+  fn degrees_map_like_dcraw() {
+    assert_eq!(exif_orientation_from_degrees(0), Some(1));
+    assert_eq!(exif_orientation_from_degrees(90), Some(6));
+    assert_eq!(exif_orientation_from_degrees(180), Some(3));
+    assert_eq!(exif_orientation_from_degrees(270), Some(8));
+    assert_eq!(exif_orientation_from_degrees(-90), Some(8));
+    assert_eq!(exif_orientation_from_degrees(45), None);
+  }
+}
+
 /// Possible orientations of an image
 ///
 /// Values are taken from the IFD tag Orientation (0x0112) in most cases but they can be

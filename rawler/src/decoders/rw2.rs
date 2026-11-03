@@ -189,7 +189,8 @@ impl<'a> Decoder for Rw2Decoder<'a> {
 
     if let Some(area) = self.get_active_area()? {
       img.active_area = Some(area);
-      img.crop_area = Some(area);
+      // AUXOUT: the crop for the aspect ratio chosen in the camera (1:1, 16:9, ...), when it lies in the active area.
+      img.crop_area = self.get_crop()?.filter(|crop| rect_within(crop, &area)).or(Some(area));
     } else if let Some(area) = self.get_crop()? {
       img.crop_area = Some(area);
     }
@@ -339,10 +340,11 @@ impl<'a> Rw2Decoder<'a> {
       let crop_top = fetch_tiff_tag!(self.tiff, PanasonicTag::CropTop).force_usize(0);
       let crop_right = fetch_tiff_tag!(self.tiff, PanasonicTag::CropRight).force_usize(0);
       let crop_bottom = fetch_tiff_tag!(self.tiff, PanasonicTag::CropBottom).force_usize(0);
-      Ok(Some(Rect::new(
-        Point::new(crop_left, crop_top),
-        Dim2::new(crop_right - crop_left, crop_bottom - crop_top),
-      )))
+      // AUXOUT: a crop that ends before it starts is ignored instead of underflowing.
+      match (crop_right.checked_sub(crop_left), crop_bottom.checked_sub(crop_top)) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Ok(Some(Rect::new(Point::new(crop_left, crop_top), Dim2::new(w, h)))),
+        _ => Ok(None),
+      }
     } else {
       Ok(None)
     }
@@ -465,4 +467,22 @@ pub enum PanasonicTag {
 pub enum CameraIfdTag {
   LensTypeMake = 0x1201,
   LensTypeModel = 0x1202,
+}
+
+/// AUXOUT: whether `inner` lies in `outer`.
+fn rect_within(inner: &Rect, outer: &Rect) -> bool {
+  inner.x() >= outer.x() && inner.y() >= outer.y() && inner.x() + inner.width() <= outer.x() + outer.width() && inner.y() + inner.height() <= outer.y() + outer.height()
+}
+
+#[cfg(test)]
+mod auxout_tests {
+  use super::*;
+
+  #[test]
+  fn aspect_crop_inside_the_active_area_is_kept() {
+    // DC-FZ80 shot at 1:1: active area 8,8 .. 4904,3680, crop 624,12 .. 4288,3676
+    let active = Rect::new(Point::new(8, 8), Dim2::new(4896, 3672));
+    assert!(rect_within(&Rect::new(Point::new(624, 12), Dim2::new(3664, 3664)), &active));
+    assert!(!rect_within(&Rect::new(Point::new(0, 0), Dim2::new(4896, 3672)), &active));
+  }
 }

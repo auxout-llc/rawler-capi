@@ -1,3 +1,4 @@
+use crate::decoders::exif_orientation_from_degrees;
 use crate::RawImage;
 use crate::RawLoader;
 use crate::RawlerError;
@@ -79,7 +80,11 @@ impl<'a> Decoder for MosDecoder<'a> {
   }
 
   fn raw_metadata(&self, _file: &RawSource, _params: &RawDecodeParams) -> Result<RawMetadata> {
-    let exif = Exif::new(self.tiff.root_ifd())?;
+    let mut exif = Exif::new(self.tiff.root_ifd())?;
+    // AUXOUT: Leaf records the turn in its own metadata (ImgProf_rotation_angle), not in TIFF.
+    if let Some(orientation) = self.leaf_rotation().and_then(exif_orientation_from_degrees) {
+      exif.orientation = Some(orientation);
+    }
     let mdata = RawMetadata::new(self.camera.metadata(), exif);
     Ok(mdata)
   }
@@ -111,6 +116,13 @@ impl<'a> MosDecoder<'a> {
       pos += 1;
     }
     Ok([f32::NAN, f32::NAN, f32::NAN, f32::NAN])
+  }
+
+  /// AUXOUT: ImgProf_rotation_angle from the Leaf metadata (PKTS entries: 40-byte name,
+  /// big-endian u32 size, ASCII value).
+  fn leaf_rotation(&self) -> Option<i32> {
+    let meta = self.tiff.get_entry(TiffCommonTag::LeafMetadata)?.get_data();
+    leaf_entry_value(meta, b"ImgProf_rotation_angle")?.trim_end_matches('\0').trim().parse().ok()
   }
 
   fn xmp_tag(tiff: &GenericTiffReader, tag: &str) -> Result<String> {
@@ -145,5 +157,42 @@ impl<'a> MosDecoder<'a> {
     } else {
       Ok(ljpegout)
     }
+  }
+}
+
+/// AUXOUT: value of one PKTS entry in the Leaf metadata, found by name.
+fn leaf_entry_value(meta: &[u8], name: &[u8]) -> Option<String> {
+  let pos = meta.windows(name.len()).position(|w| w == name)?;
+  let size = u32::from_be_bytes(meta.get(pos + 40..pos + 44)?.try_into().ok()?) as usize;
+  let value = meta.get(pos + 44..pos.checked_add(44)?.checked_add(size)?)?;
+  Some(String::from_utf8_lossy(value).into_owned())
+}
+
+#[cfg(test)]
+mod auxout_tests {
+  use super::*;
+
+  fn pkts(name: &str, value: &[u8]) -> Vec<u8> {
+    let mut out = b"PKTS\0\0\0\x01".to_vec();
+    let mut n = name.as_bytes().to_vec();
+    n.resize(40, 0);
+    out.extend_from_slice(&n);
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value);
+    out
+  }
+
+  #[test]
+  fn reads_rotation_angle_entry() {
+    let mut meta = pkts("ImgProf_other", b"1\0");
+    meta.extend(pkts("ImgProf_rotation_angle", b"90\0"));
+    assert_eq!(leaf_entry_value(&meta, b"ImgProf_rotation_angle").as_deref(), Some("90\0"));
+  }
+
+  #[test]
+  fn truncated_entry_is_none() {
+    let mut meta = pkts("ImgProf_rotation_angle", b"90\0");
+    meta.truncate(meta.len() - 2);
+    assert_eq!(leaf_entry_value(&meta, b"ImgProf_rotation_angle"), None);
   }
 }

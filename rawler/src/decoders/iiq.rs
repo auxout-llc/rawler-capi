@@ -316,7 +316,11 @@ impl<'a> Decoder for IiqDecoder<'a> {
   }
 
   fn raw_metadata(&self, _file: &RawSource, _params: &RawDecodeParams) -> Result<RawMetadata> {
-    let exif = Exif::new(self.tiff.root_ifd())?;
+    let mut exif = Exif::new(self.tiff.root_ifd())?;
+    // AUXOUT: Phase One records the turn in its own makernote (0x100), like LibRaw reads it.
+    if let Some(orientation) = self.makernotes.get(&IiqTag::Orientation.into()).map(|v| iiq_orientation(v.1.force_u32(0))) {
+      exif.orientation = Some(orientation);
+    }
     let mdata = RawMetadata::new_with_lens(self.camera.metadata(), exif, self.get_lens_description()?.cloned());
     Ok(mdata)
   }
@@ -1210,6 +1214,8 @@ impl<'a> IiqDecoder<'a> {
 #[allow(unused)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
 enum IiqTag {
+  /// AUXOUT: low 2 bits are 0 normal, 1 rotate 90 CW, 2 rotate 270 CW, 3 rotate 180
+  Orientation = 0x100,
   /// Matrix from white balanced camera values to ROMM (ProPhoto) RGB
   RommMatrix = 0x106,
   WhiteBalance = 0x107,
@@ -1237,5 +1243,24 @@ enum IiqTag {
 impl From<IiqTag> for u32 {
   fn from(v: IiqTag) -> Self {
     v as u32
+  }
+}
+
+/// AUXOUT: Phase One CameraOrientation (makernote 0x100) to EXIF orientation.
+fn iiq_orientation(value: u32) -> u16 {
+  [1, 6, 8, 3][(value & 3) as usize]
+}
+
+#[cfg(test)]
+mod auxout_tests {
+  use super::iiq_orientation;
+
+  #[test]
+  fn camera_orientation_maps_to_exif() {
+    assert_eq!(iiq_orientation(0), 1);
+    assert_eq!(iiq_orientation(1), 6);
+    assert_eq!(iiq_orientation(2), 8);
+    assert_eq!(iiq_orientation(3), 3);
+    assert_eq!(iiq_orientation(0x11), 6);
   }
 }

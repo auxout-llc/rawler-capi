@@ -106,6 +106,16 @@ impl Entry {
     }
 
     reader.goto(base + offset)?;
+    // auxout: a count that does not fit in the file is a broken tag. Refuse it before
+    // allocating: the values are read into a Vec of `count` elements, and a bogus count
+    // (up to 4G elements) aborts processes whose allocator crashes on failure (Electron).
+    let remaining = reader.remaining()?;
+    if bytesize as u64 > remaining {
+      return Err(TiffError::Overflow(format!(
+        "Tag 0x{:X} claims {} bytes but only {} remain in the file",
+        tag, bytesize, remaining
+      )));
+    }
     let entry = match typ {
       TYPE_BYTE => {
         let mut v = vec![0; count as usize];
@@ -241,5 +251,48 @@ impl Entry {
 
   pub fn type_name(&self) -> String {
     self.value.value_type_name()
+  }
+}
+
+// auxout: a tag whose count does not fit in the rest of the file is refused before its
+// values are allocated (see `Entry::parse`).
+#[cfg(test)]
+mod auxout_tests {
+  use std::io::Cursor;
+
+  use super::super::{TiffError, reader::EndianReader};
+  use crate::bits::Endian;
+  use super::*;
+
+  /// One IFD entry after the tag number: type, count and a value offset of 16.
+  fn entry_bytes(typ: u16, count: u32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&typ.to_le_bytes());
+    b.extend_from_slice(&count.to_le_bytes());
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.resize(32, 0); // 16 bytes of values at offset 16
+    b
+  }
+
+  fn parse(typ: u16, count: u32) -> Result<Entry> {
+    let mut data = vec![0u8, 0u8]; // the tag number is read by the caller
+    data.extend(entry_bytes(typ, count));
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(2);
+    let mut reader = EndianReader::new(&mut cursor, Endian::Little);
+    Entry::parse(&mut reader, 0, 0, 0x9999)
+  }
+
+  #[test]
+  fn refuses_a_count_larger_than_the_file() {
+    // 0xFFFF_FFFF doubles would be 32 GB
+    assert!(matches!(parse(TYPE_DOUBLE, u32::MAX), Err(TiffError::Overflow(_))));
+    // 5 longs = 20 bytes, but only 16 bytes follow the offset
+    assert!(matches!(parse(TYPE_LONG, 5), Err(TiffError::Overflow(_))));
+  }
+
+  #[test]
+  fn reads_a_count_that_fits() {
+    assert!(parse(TYPE_LONG, 4).is_ok());
   }
 }

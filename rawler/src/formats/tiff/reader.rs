@@ -291,6 +291,15 @@ impl<'a, R: Read + Seek + 'a> EndianReader<'a, R> {
     Ok(self.inner.stream_position().map(|v| v as u32)?)
   }
 
+  /// auxout: bytes left from the current position to the end of the stream.
+  /// The position is kept.
+  pub fn remaining(&mut self) -> Result<u64> {
+    let pos = self.inner.stream_position()?;
+    let end = self.inner.seek(SeekFrom::End(0))?;
+    self.inner.seek(SeekFrom::Start(pos))?;
+    Ok(end.saturating_sub(pos))
+  }
+
   // TODO: try_from?
 
   pub fn goto(&mut self, offset: u32) -> Result<()> {

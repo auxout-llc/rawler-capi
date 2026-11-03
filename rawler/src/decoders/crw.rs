@@ -109,7 +109,9 @@ impl<'a> Decoder for CrwDecoder<'a> {
 
   fn raw_metadata(&self, _file: &RawSource, __params: &RawDecodeParams) -> Result<RawMetadata> {
     // TODO: Add EXIF info
-    let exif = Exif::default();
+    let mut exif = Exif::default();
+    // AUXOUT: the orientation lives in ImageInfo (0x1810), not in an EXIF block.
+    exif.orientation = self.ciff.find_entry(CiffTag::ImageInfo).and_then(ciff_rotation_to_orientation);
     Ok(RawMetadata::new(self.camera.metadata(), exif))
   }
 
@@ -287,4 +289,29 @@ fn normalize_wb(raw_wb: [f32; 4]) -> [f32; 4] {
     }
   });
   [norm[0], (norm[1] + norm[2]) / 2.0, norm[3], f32::NAN]
+}
+
+/// AUXOUT: ImageInfo (0x1810) is width, height, pixel aspect, rotation in degrees.
+fn ciff_rotation_to_orientation(entry: &crate::formats::ciff::CiffEntry) -> Option<u16> {
+  let rotation = entry.data.get(12..16)?;
+  exif_orientation_from_degrees(i32::from_le_bytes(rotation.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod auxout_tests {
+  use super::*;
+  use crate::formats::ciff::CiffEntry;
+
+  fn image_info(rotation: i32) -> CiffEntry {
+    let mut data = vec![0u8; 12];
+    data.extend_from_slice(&rotation.to_le_bytes());
+    CiffEntry { tag: 0x1810, typ: 0x1800, count: 4, bytesize: 16, data_offset: 0, data }
+  }
+
+  #[test]
+  fn image_info_rotation_maps_to_exif_orientation() {
+    assert_eq!(ciff_rotation_to_orientation(&image_info(90)), Some(6));
+    assert_eq!(ciff_rotation_to_orientation(&image_info(270)), Some(8));
+    assert_eq!(ciff_rotation_to_orientation(&CiffEntry { data: vec![0; 8], ..image_info(0) }), None);
+  }
 }

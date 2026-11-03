@@ -216,7 +216,10 @@ impl<'a> Decoder for ArwDecoder<'a> {
     } else {
       img.active_area = camera.active_area.map(|area| Rect::new_with_borders(Dim2::new(width, height), &area));
     }
-    img.crop_area = Rect::from_tiff(raw).or_else(|| camera.crop_area.map(|area| Rect::new_with_borders(Dim2::new(width, height), &area)));
+    // AUXOUT: the crop for the aspect ratio chosen in the camera comes first (SonyCropTopLeft / SonyCropSize).
+    img.crop_area = sony_crop(raw)
+      .or_else(|| Rect::from_tiff(raw))
+      .or_else(|| camera.crop_area.map(|area| Rect::new_with_borders(Dim2::new(width, height), &area)));
 
     log::debug!("raw dim: {}x{}", width, height);
     log::debug!("crop_area: {:?}", img.crop_area);
@@ -892,4 +895,12 @@ mod arq_tests {
     let cfa = crate::cfa::CFA::new("RGGB");
     assert!(decode_arq(&[0u8; 10], 2, 1, &cfa, false).is_err());
   }
+}
+
+/// AUXOUT: the crop recorded for the aspect ratio chosen in the camera (raw coordinates).
+fn sony_crop(raw_ifd: &IFD) -> Option<Rect> {
+  let top_left = raw_ifd.get_entry(ExifTag::SonyCropTopLeft)?;
+  let size = raw_ifd.get_entry(ExifTag::SonyCropSize)?;
+  let (w, h) = (size.force_usize(0), size.force_usize(1));
+  (w > 0 && h > 0).then(|| Rect::new(Point::new(top_left.force_usize(0), top_left.force_usize(1)), Dim2::new(w, h)))
 }
