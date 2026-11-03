@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: LGPL-2.1
+// Copyright 2021 Daniel Vogelbacher <daniel@chaospixel.com>
+
+/// Matrix in row-major order, the dimensions are given by the context
+pub type FlatMatrix = Vec<f32>;
+
+pub const IDENTITY_MATRIX_3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Multiply two matrices a and b
+pub fn multiply<const X: usize, const A: usize, const B: usize>(a: &[[f32; X]; A], b: &[[f32; B]; X]) -> [[f32; B]; A] {
+  let mut r = [[0.0; B]; A];
+  for i in 0..A {
+    for j in 0..B {
+      for x in 0..X {
+        r[i][j] += a[i][x] * b[x][j];
+      }
+    }
+  }
+  r
+}
+
+#[inline(always)]
+pub fn multiply_row1(a: &[[f32; 3]; 3], b: &[f32; 3]) -> [f32; 3] {
+  [
+    a[0][0] * b[0] + a[0][1] * b[1] + a[0][2] * b[2],
+    a[1][0] * b[0] + a[1][1] * b[1] + a[1][2] * b[2],
+    a[2][0] * b[0] + a[2][1] * b[1] + a[2][2] * b[2],
+  ]
+}
+
+/// Normalize a matrix so that the sum of each row equals to 1.0
+pub fn normalize<const N: usize, const M: usize>(rgb2cam: [[f32; N]; M]) -> [[f32; N]; M] {
+  let mut result = [[0.0; N]; M];
+  for m in 0..M {
+    let sum: f32 = rgb2cam[m].iter().sum();
+    if sum.abs() != 0.0 {
+      for n in 0..N {
+        result[m][n] = rgb2cam[m][n] / sum;
+      }
+    }
+  }
+  result
+}
+
+/// Calculate pseudo-inverse of a given matrix
+pub fn pseudo_inverse<const N: usize>(matrix: [[f32; 3]; N]) -> [[f32; N]; 3] {
+  let mut tmp: [[f32; 3]; N] = [Default::default(); N];
+  let mut result: [[f32; N]; 3] = [[Default::default(); N]; 3];
+
+  let mut work: [[f32; 6]; 3] = [Default::default(); 3];
+  for i in 0..3 {
+    for j in 0..6 {
+      work[i][j] = if j == i + 3 { 1.0 } else { 0.0 };
+    }
+    for j in 0..3 {
+      for k in 0..N {
+        work[i][j] += matrix[k][i] * matrix[k][j];
+      }
+    }
+  }
+  for i in 0..3 {
+    let mut num = work[i][i];
+    for j in 0..6 {
+      work[i][j] /= num;
+    }
+    for k in 0..3 {
+      if k == i {
+        continue;
+      }
+      num = work[k][i];
+      for j in 0..6 {
+        work[k][j] -= work[i][j] * num;
+      }
+    }
+  }
+  for i in 0..N {
+    for j in 0..3 {
+      tmp[i][j] = 0.0;
+      for k in 0..3 {
+        tmp[i][j] += work[j][k + 3] * matrix[i][k];
+      }
+    }
+  }
+  for i in 0..3 {
+    for j in 0..N {
+      result[i][j] = tmp[j][i];
+    }
+  }
+  result
+}
+
+/// Project each row of a matrix onto the probability simplex
+///
+/// Each row is replaced by the nearest row (Euclidean distance) with
+/// non-negative entries that sum to 1.0.
+pub fn project_rows_to_simplex<const N: usize, const M: usize>(matrix: [[f32; N]; M]) -> [[f32; N]; M] {
+  matrix.map(|row| {
+    let mut sorted = row;
+    sorted.sort_by(|a, b| b.total_cmp(a));
+    let mut sum = 0.0;
+    let mut theta = 0.0;
+    for (k, v) in sorted.iter().enumerate() {
+      sum += v;
+      let t = (sum - 1.0) / (k + 1) as f32;
+      if v - t > 0.0 {
+        theta = t;
+      }
+    }
+    row.map(|v| (v - theta).max(0.0))
+  })
+}
+
+/// Calculate the determinant of a 3x3 matrix
+pub fn determinant(m: &[[f32; 3]; 3]) -> f32 {
+  m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+/// Identity matrix of size N x N
+pub fn identity<const N: usize>() -> [[f32; N]; N] {
+  std::array::from_fn(|i| std::array::from_fn(|j| if i == j { 1.0 } else { 0.0 }))
+}
+
+/// Diagonal matrix with `values` on the diagonal
+pub fn diagonal<const N: usize>(values: &[f32; N]) -> [[f32; N]; N] {
+  std::array::from_fn(|i| std::array::from_fn(|j| if i == j { values[i] } else { 0.0 }))
+}
+
+/// Multiply matrix with a column vector
+pub fn multiply_vector<const N: usize, const M: usize>(matrix: &[[f32; N]; M], vector: &[f32; N]) -> [f32; M] {
+  matrix.map(|row| row.iter().zip(vector).map(|(a, b)| a * b).sum())
+}
+
+/// Invert a square matrix by Gauss-Jordan elimination, `None` if it is singular
+pub fn invert<const N: usize>(matrix: &[[f32; N]; N]) -> Option<[[f32; N]; N]> {
+  let mut work = *matrix;
+  let mut inverse = identity::<N>();
+  for col in 0..N {
+    // Partial pivoting: use the row with the largest value in this column
+    let pivot = (col..N).max_by(|a, b| work[*a][col].abs().total_cmp(&work[*b][col].abs()))?;
+    if work[pivot][col].abs() < f32::EPSILON {
+      return None;
+    }
+    work.swap(col, pivot);
+    inverse.swap(col, pivot);
+    let scale = work[col][col];
+    for j in 0..N {
+      work[col][j] /= scale;
+      inverse[col][j] /= scale;
+    }
+    for row in 0..N {
+      if row != col {
+        let factor = work[row][col];
+        for j in 0..N {
+          work[row][j] -= factor * work[col][j];
+          inverse[row][j] -= factor * inverse[col][j];
+        }
+      }
+    }
+  }
+  Some(inverse)
+}
+
+/// Transpose a given input matrix
+pub fn transpose<const N: usize, const M: usize>(matrix: &[[f32; M]; N]) -> [[f32; N]; M] {
+  let mut transposed = [[f32::NAN; N]; M];
+  for n in 0..N {
+    for m in 0..M {
+      transposed[m][n] = matrix[n][m];
+    }
+  }
+  transposed
+}
+
+/// Transform a 2D matrix representation to 1D
+pub fn transform_2d<const N: usize, const M: usize>(matrix: &[[f32; M]; N]) -> Vec<f32> {
+  matrix.iter().flat_map(|n| n.iter().cloned()).collect()
+}
+
+/// Transform a 1D matrix representation to 2D
+pub fn transform_1d<const N: usize, const M: usize>(matrix: &[f32]) -> Option<[[f32; M]; N]> {
+  if matrix.len() != (N * M) {
+    return None;
+  };
+  let mut transformed = [[f32::NAN; M]; N];
+  for (i, v) in matrix.iter().cloned().enumerate() {
+    *transformed.get_mut(i / M).and_then(|inner| inner.get_mut(i % M))? = v;
+  }
+  Some(transformed)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn transform_1d_to_2d() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let m1d = vec![1.3, 5.3, 6.1, 4.2, 8.3, 8.2];
+    assert!(transform_1d::<2, 3>(&m1d).is_some());
+    assert!(transform_1d::<3, 2>(&m1d).is_some());
+    assert!(transform_1d::<1, 1>(&m1d).is_none());
+    assert!(transform_1d::<6, 7>(&m1d).is_none());
+    Ok(())
+  }
+
+  fn assert_matrix_eq<const N: usize, const M: usize>(a: &[[f32; N]; M], b: &[[f32; N]; M]) {
+    for (x, y) in a.as_flattened().iter().zip(b.as_flattened()) {
+      assert!((x - y).abs() < 1e-5, "{:?} != {:?}", a, b);
+    }
+  }
+
+  #[test]
+  fn invert_matrix() {
+    let m3 = [[0.6722, -0.0635, -0.0963], [-0.4287, 1.2460, 0.2028], [-0.0908, 0.2162, 0.5668]];
+    assert_matrix_eq(&multiply(&m3, &invert(&m3).expect("invertible")), &identity());
+    // A zero pivot in the first column requires a row swap
+    let m4 = [[0.0, 2.0, 0.0, 1.0], [1.0, 0.0, 0.5, 0.0], [0.0, 0.3, 1.0, 0.0], [0.2, 0.0, 0.0, 1.5]];
+    assert_matrix_eq(&multiply(&invert(&m4).expect("invertible"), &m4), &identity());
+    assert_eq!(invert(&identity::<4>()), Some(identity::<4>()));
+    assert_eq!(invert(&[[1.0, 2.0], [2.0, 4.0]]), None);
+  }
+
+  #[test]
+  fn diagonal_and_vector() {
+    let m = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+    assert_eq!(multiply_vector(&m, &[1.0, 0.0, 2.0]), [7.0, 16.0]);
+    assert_eq!(multiply(&m, &diagonal(&[2.0, 1.0, 0.5])), [[2.0, 2.0, 1.5], [8.0, 5.0, 3.0]]);
+  }
+
+  #[test]
+  fn rows_projected_to_simplex() {
+    let projected = project_rows_to_simplex([[0.2, 0.3, 0.5], [2.0, 0.0, 0.0], [0.5, 0.5, -1.0], [1.2, 0.4, -0.6]]);
+    assert_eq!(projected[0], [0.2, 0.3, 0.5]);
+    assert_eq!(projected[1], [1.0, 0.0, 0.0]);
+    assert_eq!(projected[2], [0.5, 0.5, 0.0]);
+    assert!(
+      projected[3].iter().zip([0.9, 0.1, 0.0]).all(|(a, b)| (a - b).abs() < 1e-6),
+      "{:?}",
+      projected[3]
+    );
+    for row in projected {
+      assert!(row.iter().all(|v| *v >= 0.0));
+      assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+  }
+
+  #[test]
+  fn determinant_3x3() {
+    assert_eq!(determinant(&IDENTITY_MATRIX_3), 1.0);
+    assert_eq!(determinant(&[[2.0, 0.0, 1.0], [1.0, 3.0, 2.0], [1.0, 1.0, 2.0]]), 6.0);
+    assert_eq!(determinant(&[[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [0.0, 1.0, 1.0]]), 0.0);
+  }
+}

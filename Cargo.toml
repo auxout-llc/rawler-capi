@@ -15,6 +15,11 @@ crate-type = ["cdylib"]
 rawler = { git = "https://github.com/dnglab/dnglab", rev = "1fcc4a5607591178d2b335845a7e5ee09f89a37f", default-features = true }
 rayon = "1"
 
+# rawler with our changes (rawler/AUXOUT-CHANGES.md), on top of the commit above.
+# LGPL-2.1: the changed source ships in this repository (the `raw-core-<commit>` tag).
+[patch."https://github.com/dnglab/dnglab"]
+rawler = { path = "rawler" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

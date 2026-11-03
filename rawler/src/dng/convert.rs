@@ -1,0 +1,1017 @@
+use std::{
+  ffi::OsStr,
+  io::{Cursor, Seek, Write},
+  path::Path,
+  sync::Arc,
+  thread::JoinHandle,
+  time::SystemTime,
+};
+
+use image::DynamicImage;
+
+use crate::camera_profile::{CALIBRATION_SLOTS, d65_preference};
+use crate::{
+  RawImage, RawImageData, RawlerError,
+  decoders::{Decoder, RawDecodeParams, RawPhotometricInterpretation, WellKnownIFD, WhiteLevel, validate_image_index},
+  dng::{
+    DEFAULT_LOSSY_JPEG_QUALITY, PREVIEW_JPEG_QUALITY,
+    opcodes::{OpcodeSelector, OpcodeStage},
+    original::OriginalCompressed,
+    writer::DngWriter,
+  },
+  formats::tiff::Entry,
+  imgop::{
+    matrix::{multiply, transform_1d, transform_2d},
+    raw::map_4ch_to_3ch,
+    render::{DemosaicQuality, ProcessingStep, RenderOptions, StepSet, render, render_linear_raw},
+  },
+  pixarray::Color2D,
+  rawimage::BlackLevel,
+  rawsource::RawSource,
+  tags::{DngTag, ExifTag, TiffCommonTag},
+};
+
+use super::{
+  ApplyDngOpcodes, CompressionParams, CropMode, DEFAULT_JXL_DECODE_SPEED, DEFAULT_JXL_DISTANCE, DEFAULT_JXL_EFFORT, DngCompression, DngPhotometricConversion,
+  DngVersion, JxlParams,
+};
+
+/// Opcode list stages in processing order
+const STAGES: [OpcodeStage; 3] = [OpcodeStage::List1, OpcodeStage::List2, OpcodeStage::List3];
+
+/// Tags with values for each color plane, copied from DNG input.
+/// They don't match the image data after the color planes are reduced.
+const COLOR_PLANE_TAGS: [DngTag; 2] = [DngTag::AsShotPreProfileMatrix, DngTag::CurrentPreProfileMatrix];
+
+/// Tags only allowed for CFA image data, copied from DNG input.
+/// They are invalid after the image data is demosaiced.
+const CFA_TAGS: [DngTag; 1] = [DngTag::BayerGreenSplit];
+
+/// Parameters for DNG conversion
+#[derive(Clone, Debug)]
+pub struct ConvertParams {
+  pub embedded: bool,
+  pub compression: DngCompression,
+  pub photometric_conversion: DngPhotometricConversion,
+  pub apply_scaling: bool,
+  pub crop: CropMode,
+  pub predictor: u8,
+  /// JPEG quality (1-100) for lossy compression
+  pub lossy_jpeg_quality: u8,
+  /// JPEG XL distance, 0.0 is lossless
+  pub jxl_distance: f32,
+  /// JPEG XL effort (1-9)
+  pub jxl_effort: u8,
+  /// JPEG XL decoding speed (1-4), only used for lossy compression
+  pub jxl_decode_speed: u8,
+  pub preview: bool,
+  pub thumbnail: bool,
+  /// Develop the preview from raw data instead of using an embedded preview
+  pub force_preview: bool,
+  /// Develop the thumbnail from raw data instead of using an embedded preview
+  pub force_thumbnail: bool,
+  pub artist: Option<String>,
+  pub copyright: Option<String>,
+  pub software: String,
+  pub index: usize,
+  pub keep_mtime: bool,
+  /// Value for DNGVersion tag
+  pub dng_version: DngVersion,
+  /// Highest allowed value for DNGBackwardVersion tag
+  pub max_dng_backward_version: DngVersion,
+  /// DNG opcode lists to apply to the image data, in addition to the lists
+  /// that can't be stored with `max_dng_backward_version`
+  pub apply_dng_opcodes: ApplyDngOpcodes,
+  /// DNG opcodes to remove, they are neither applied nor written to the DNG
+  pub remove_dng_opcodes: Vec<OpcodeSelector>,
+}
+
+/// Information surfaced from a completed conversion.
+///
+/// Lets callers reuse work the converter already performed (such as the
+/// metadata pass) instead of re-running the decoder.
+#[derive(Clone, Debug, Default)]
+pub struct ConvertInfo {
+  /// Embedded "last modified" timestamp recovered from the input's metadata,
+  /// if the decoder was able to find one.
+  pub last_modified: Option<SystemTime>,
+}
+
+impl Default for ConvertParams {
+  fn default() -> Self {
+    Self {
+      embedded: true,
+      compression: DngCompression::Lossless,
+      photometric_conversion: DngPhotometricConversion::Original,
+      apply_scaling: false,
+      crop: CropMode::Best,
+      predictor: 1,
+      lossy_jpeg_quality: DEFAULT_LOSSY_JPEG_QUALITY,
+      jxl_distance: DEFAULT_JXL_DISTANCE,
+      jxl_effort: DEFAULT_JXL_EFFORT,
+      jxl_decode_speed: DEFAULT_JXL_DECODE_SPEED,
+      preview: true,
+      thumbnail: true,
+      force_preview: false,
+      force_thumbnail: false,
+      artist: None,
+      copyright: None,
+      software: "DNGLab".into(),
+      index: 0,
+      keep_mtime: false,
+      dng_version: DngVersion::V1_7_1,
+      max_dng_backward_version: DngVersion::V1_4,
+      apply_dng_opcodes: ApplyDngOpcodes::Auto,
+      remove_dng_opcodes: Vec::new(),
+    }
+  }
+}
+
+impl ConvertParams {
+  /// Set whether the original raw file is embedded into the DNG.
+  pub fn with_embedded(mut self, embedded: bool) -> Self {
+    self.embedded = embedded;
+    self
+  }
+
+  /// Set the DNG compression method.
+  pub fn with_compression(mut self, compression: DngCompression) -> Self {
+    self.compression = compression;
+    self
+  }
+
+  /// Set the photometric conversion mode.
+  pub fn with_photometric_conversion(mut self, photometric_conversion: DngPhotometricConversion) -> Self {
+    self.photometric_conversion = photometric_conversion;
+    self
+  }
+
+  /// Set whether black/white level scaling is applied.
+  pub fn with_apply_scaling(mut self, apply_scaling: bool) -> Self {
+    self.apply_scaling = apply_scaling;
+    self
+  }
+
+  /// Set the crop mode.
+  pub fn with_crop(mut self, crop: CropMode) -> Self {
+    self.crop = crop;
+    self
+  }
+
+  /// Set the compression predictor.
+  pub fn with_predictor(mut self, predictor: u8) -> Self {
+    self.predictor = predictor;
+    self
+  }
+
+  /// Set the JPEG quality (1-100) for lossy compression.
+  pub fn with_lossy_jpeg_quality(mut self, lossy_jpeg_quality: u8) -> Self {
+    self.lossy_jpeg_quality = lossy_jpeg_quality;
+    self
+  }
+
+  /// Set the JPEG XL distance, 0.0 is lossless.
+  pub fn with_jxl_distance(mut self, jxl_distance: f32) -> Self {
+    self.jxl_distance = jxl_distance;
+    self
+  }
+
+  /// Set the JPEG XL effort (1-9).
+  pub fn with_jxl_effort(mut self, jxl_effort: u8) -> Self {
+    self.jxl_effort = jxl_effort;
+    self
+  }
+
+  /// Set the JPEG XL decoding speed (1-4) for lossy compression.
+  pub fn with_jxl_decode_speed(mut self, jxl_decode_speed: u8) -> Self {
+    self.jxl_decode_speed = jxl_decode_speed;
+    self
+  }
+
+  /// Parameters of the compression methods
+  pub fn compression_params(&self) -> CompressionParams {
+    CompressionParams {
+      ljpeg92_predictor: self.predictor,
+      lossy_jpeg_quality: self.lossy_jpeg_quality,
+      jxl: JxlParams {
+        distance: self.jxl_distance,
+        effort: self.jxl_effort,
+        decode_speed: self.jxl_decode_speed,
+      },
+    }
+  }
+
+  /// Opcode lists to apply to the image data, `apply_dng_opcodes` adjusted for the compression
+  ///
+  /// Lossy JPEG XL stores curve encoded raw values and readers apply OpcodeList1 to
+  /// the stored values, so OpcodeList1 is applied to the raw values before compression.
+  fn effective_apply_dng_opcodes(&self) -> ApplyDngOpcodes {
+    let jxl_lossy = self.compression == DngCompression::JpegXl && !self.compression_params().jxl.is_lossless();
+    match self.apply_dng_opcodes {
+      ApplyDngOpcodes::Auto if jxl_lossy => ApplyDngOpcodes::List1,
+      apply => apply,
+    }
+  }
+
+  /// Set whether a preview image is generated.
+  pub fn with_preview(mut self, preview: bool) -> Self {
+    self.preview = preview;
+    self
+  }
+
+  /// Set whether a thumbnail image is generated.
+  pub fn with_thumbnail(mut self, thumbnail: bool) -> Self {
+    self.thumbnail = thumbnail;
+    self
+  }
+
+  /// Set whether the preview image is developed from raw data.
+  pub fn with_force_preview(mut self, force_preview: bool) -> Self {
+    self.force_preview = force_preview;
+    self
+  }
+
+  /// Set whether the thumbnail image is developed from raw data.
+  pub fn with_force_thumbnail(mut self, force_thumbnail: bool) -> Self {
+    self.force_thumbnail = force_thumbnail;
+    self
+  }
+
+  /// Set the artist metadata field.
+  pub fn with_artist(mut self, artist: Option<String>) -> Self {
+    self.artist = artist;
+    self
+  }
+
+  /// Set the copyright metadata field.
+  pub fn with_copyright(mut self, copyright: Option<String>) -> Self {
+    self.copyright = copyright;
+    self
+  }
+
+  /// Set the software metadata field.
+  pub fn with_software(mut self, software: String) -> Self {
+    self.software = software;
+    self
+  }
+
+  /// Set the image index to convert.
+  pub fn with_index(mut self, index: usize) -> Self {
+    self.index = index;
+    self
+  }
+
+  /// Set whether the source modification time is preserved.
+  pub fn with_keep_mtime(mut self, keep_mtime: bool) -> Self {
+    self.keep_mtime = keep_mtime;
+    self
+  }
+
+  /// Set the DNGVersion.
+  pub fn with_dng_version(mut self, dng_version: DngVersion) -> Self {
+    self.dng_version = dng_version;
+    self
+  }
+
+  /// Set the highest allowed DNGBackwardVersion.
+  pub fn with_max_dng_backward_version(mut self, max_dng_backward_version: DngVersion) -> Self {
+    self.max_dng_backward_version = max_dng_backward_version;
+    self
+  }
+
+  /// Set the DNG opcode lists to apply to the image data.
+  pub fn with_apply_dng_opcodes(mut self, apply_dng_opcodes: ApplyDngOpcodes) -> Self {
+    self.apply_dng_opcodes = apply_dng_opcodes;
+    self
+  }
+
+  /// Set the DNG opcodes to remove.
+  pub fn with_remove_dng_opcodes(mut self, remove_dng_opcodes: Vec<OpcodeSelector>) -> Self {
+    self.remove_dng_opcodes = remove_dng_opcodes;
+    self
+  }
+}
+
+/// Convert a raw input file into DNG
+///
+/// We don't accept a DNG file path here, because we don't know
+/// how to handle existing target files, buffering, etc.
+/// This is up to the caller.
+pub fn convert_raw_file<W: Write + Seek + Send>(raw: &Path, dng: &mut W, params: &ConvertParams) -> crate::Result<ConvertInfo> {
+  let original_filename = raw.file_name().and_then(OsStr::to_str).unwrap_or_default();
+  //let raw_stream = BufReader::new(File::open(raw)?); // TODO: add path hint to error?
+  //let rawfile = RawFile::new(PathBuf::from(raw), raw_stream);
+
+  let rawfile = Arc::new(RawSource::new(raw)?);
+
+  let original_compress_thread = if params.embedded {
+    let orig_source = rawfile.clone();
+    Some(std::thread::spawn(move || OriginalCompressed::compress(&mut orig_source.reader())))
+  } else {
+    None
+  };
+
+  internal_convert(&rawfile, dng, original_filename, original_compress_thread, params)
+}
+
+/// Convert a raw input file into DNG
+pub fn convert_raw_source<W>(raw_source: &RawSource, dng: &mut W, original_filename: impl AsRef<str>, params: &ConvertParams) -> crate::Result<ConvertInfo>
+where
+  W: Write + Seek + Send,
+{
+  let original_compress_thread = if params.embedded {
+    let mut original_stream = Cursor::new(raw_source.as_vec()?);
+    Some(std::thread::spawn(move || OriginalCompressed::compress(&mut original_stream)))
+  } else {
+    None
+  };
+
+  internal_convert(raw_source, dng, original_filename, original_compress_thread, params)
+}
+
+fn internal_convert<W>(
+  rawfile: &RawSource,
+  dng: &mut W,
+  original_filename: impl AsRef<str>,
+  original_compress_thread: Option<JoinHandle<Result<OriginalCompressed, std::io::Error>>>,
+  params: &ConvertParams,
+) -> crate::Result<ConvertInfo>
+where
+  W: Write + Seek + Send,
+{
+  let decoder = crate::get_decoder(rawfile)?;
+  let raw_params = RawDecodeParams { image_index: params.index };
+  validate_image_index(decoder.as_ref(), &raw_params)?;
+  let mut rawimage = decoder.raw_image(rawfile, &raw_params, false)?;
+  rawimage.remove_opcodes(&params.remove_dng_opcodes);
+  let metadata = decoder.raw_metadata(rawfile, &raw_params)?;
+
+  log::info!(
+    "DNG conversion: '{}', make: {}, model: {}, raw-image-count: {}",
+    original_filename.as_ref(),
+    rawimage.clean_make,
+    rawimage.clean_model,
+    decoder.raw_image_count()?
+  );
+  log::debug!("Raw image WB coeff: {:?}", rawimage.wb_coeffs);
+
+  // If the raw image needs to be rotated, we do this before
+  // writing the image to DNG. This requires scaling and debayer
+  // to be applied.
+  let fuji_rotation = rawimage.camera.find_hint("fuji_rotation") || rawimage.camera.find_hint("fuji_rotation_alt");
+  let max_backward_version = params.max_dng_backward_version.as_dng_value();
+  let present = STAGES.map(|stage| rawimage.opcode_list(stage).is_some_and(|list| !list.is_empty()));
+  let needs_processing = STAGES.map(|stage| rawimage.opcode_list(stage).is_some_and(|list| list.needs_processing(max_backward_version)));
+  let required_stage = required_stage(fuji_rotation, params.apply_scaling, params.compression);
+  let (data_stage, apply) = processing_plan(present, needs_processing, params.effective_apply_dng_opcodes(), required_stage);
+  for (stage, apply) in STAGES.into_iter().zip(apply) {
+    // Bring the image data into the state the stage operates on
+    match stage {
+      OpcodeStage::List2 if data_stage >= stage => rawimage.apply_scaling()?,
+      OpcodeStage::List3 if data_stage >= stage => {
+        if fuji_rotation {
+          log::debug!("Raw image requires fuji_rotation before writing to DNG");
+        }
+        rawimage = demosaic_to_linear_raw(rawimage, fuji_rotation)?;
+      }
+      _ => {}
+    }
+    if apply {
+      log::debug!("Apply {} to the image data", stage);
+      rawimage.apply_opcode_list(stage).map_err(|err| {
+        RawlerError::DecoderFailed(format!(
+          "Can't apply {} to the image data: {}",
+          stage,
+          match err {
+            RawlerError::DecoderFailed(msg) => msg,
+            err => err.to_string(),
+          }
+        ))
+      })?;
+    }
+  }
+  // Lossy JPEG and JPEG XL support one or three color planes
+  let reduced_planes = matches!(params.compression, DngCompression::Lossy | DngCompression::JpegXl) && rawimage.cpp == 4;
+  if reduced_planes {
+    // OpcodeList3 addresses the four color planes
+    rawimage.apply_opcode_list(OpcodeStage::List3)?;
+    reduce_to_three_planes(&mut rawimage)?;
+  }
+  let cfa = matches!(rawimage.photometric, RawPhotometricInterpretation::Cfa(_));
+  let copy_tag = |tag: &u16| {
+    let listed = |tags: &[DngTag]| tags.iter().any(|t| *t as u16 == *tag);
+    if reduced_planes && listed(&COLOR_PLANE_TAGS) {
+      log::debug!("Color planes are reduced, tag 0x{:04x} is not copied", tag);
+      return false;
+    }
+    if !cfa && listed(&CFA_TAGS) {
+      log::debug!("Image data is not CFA, tag 0x{:04x} is not copied", tag);
+      return false;
+    }
+    true
+  };
+
+  let mut dng = DngWriter::new_with_version(dng, params.dng_version.as_dng_value(), max_backward_version)?;
+
+  // Write RAW image for subframe type 0
+  // If no thumbnail should be written to root IFD, we need to put the raw image into
+  // root IFD instead.
+  let mut raw = if params.thumbnail { dng.subframe(0) } else { dng.subframe_on_root(0) };
+  raw.raw_image(
+    &rawimage,
+    params.crop,
+    params.compression,
+    params.photometric_conversion,
+    &params.compression_params(),
+  )?;
+  // Check for DNG raw IFD related tags
+  if let Some(dng_raw_ifd) = decoder.ifd(WellKnownIFD::VirtualDngRawTags)? {
+    // Opcode lists are written by raw_image(), they may have been applied to the image data
+    let opcode_lists = [DngTag::OpcodeList1 as u16, DngTag::OpcodeList2 as u16, DngTag::OpcodeList3 as u16];
+    raw
+      .ifd_mut()
+      .copy(dng_raw_ifd.value_iter().filter(|(tag, _)| !opcode_lists.contains(tag) && copy_tag(tag)));
+  }
+  raw.finalize()?;
+
+  // Write preview and thumbnail if requested
+  if params.preview || params.thumbnail {
+    // Each source image is generated at most once, and only if required.
+    let need_embedded = (params.preview && !params.force_preview) || (params.thumbnail && !params.force_thumbnail);
+    let need_developed = (params.preview && params.force_preview) || (params.thumbnail && params.force_thumbnail);
+    let load = |force_develop: bool| match generate_preview(rawfile, decoder.as_ref(), &rawimage, &raw_params, force_develop) {
+      Ok(image) => Some(image),
+      Err(err) => {
+        log::warn!("Failed to get review image, continue anyway: {:?}", err);
+        None
+      }
+    };
+    let embedded = if need_embedded { load(false) } else { None };
+    let developed = if need_developed { load(true) } else { None };
+    let select = |force: bool| if force { developed.as_ref() } else { embedded.as_ref() };
+
+    if params.preview {
+      if let Some(image) = select(params.force_preview) {
+        let mut preview = dng.subframe(1);
+        preview.preview(image, PREVIEW_JPEG_QUALITY)?;
+        preview.finalize()?;
+      }
+    }
+    if params.thumbnail {
+      if let Some(image) = select(params.force_thumbnail) {
+        dng.thumbnail(image)?;
+      }
+    }
+  }
+  // Write metadata
+  dng.load_base_tags(&rawimage)?;
+  dng.load_metadata(&metadata)?;
+  if !dng.root_ifd().contains(ExifTag::Orientation) {
+    dng.root_ifd_mut().add_tag(ExifTag::Orientation, rawimage.orientation.to_u16());
+  }
+
+  // Check for DNG root IFD related tags
+  if let Some(dng_root_ifd) = decoder.ifd(WellKnownIFD::VirtualDngRootTags)? {
+    dng.root_ifd_mut().copy(dng_root_ifd.value_iter().filter(|(tag, _)| copy_tag(tag)));
+  }
+
+  // Check for TIFF root IFD related tags
+  if let Some(tiff_root) = decoder.ifd(WellKnownIFD::Root)? {
+    dng.root_ifd_mut().copy(tiff_root.value_iter().filter(|(tag, _)| {
+      [
+        // Tags from CinemaDNG files
+        TiffCommonTag::TimeCodes as u16,
+        TiffCommonTag::FrameFrate as u16,
+        TiffCommonTag::TStop as u16,
+      ]
+      .contains(tag)
+    }));
+  }
+
+  // Remove makernotes from EXIF if MakerNoteSafety is not 1 (safe)
+  if let Some(Entry {
+    value: crate::formats::tiff::Value::Short(v),
+    ..
+  }) = decoder
+    .ifd(WellKnownIFD::VirtualDngRootTags)?
+    .and_then(|ifd| ifd.get_entry(DngTag::MakerNoteSafety).cloned())
+  {
+    if v.get(0).copied().unwrap_or(0) == 0 {
+      dng.exif_ifd_mut().remove_tag(ExifTag::MakerNotes);
+    }
+  }
+
+  if let Some(xpacket) = decoder.xpacket(rawfile, &raw_params)? {
+    dng.xpacket(&xpacket)?;
+  }
+
+  if let Some(handle) = original_compress_thread {
+    let original = handle
+      .join()
+      .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to join compression thread: {:?}", err)))??;
+    dng.original_file(&original, original_filename)?;
+  }
+
+  if let Some(artist) = &params.artist {
+    dng.root_ifd_mut().add_tag(TiffCommonTag::Artist, artist);
+  }
+  if let Some(copyright) = &params.copyright {
+    dng.root_ifd_mut().add_tag(ExifTag::Copyright, copyright);
+  }
+  dng.root_ifd_mut().add_tag(TiffCommonTag::Software, &params.software);
+
+  dng
+    .root_ifd_mut()
+    .add_tag(ExifTag::ModifyDate, chrono::Local::now().format("%Y:%m:%d %H:%M:%S").to_string());
+
+  dng.close()?;
+
+  let last_modified = match metadata.last_modified() {
+    Ok(Some(last_modified)) => Some(last_modified),
+    Err(err) => {
+      log::warn!("Failed to get last-modified: {:?}", err);
+      None
+    }
+    _ => None,
+  };
+  Ok(ConvertInfo { last_modified })
+}
+
+/// Minimum processing stage of the image data written to DNG
+fn required_stage(fuji_rotation: bool, apply_scaling: bool, compression: DngCompression) -> OpcodeStage {
+  if fuji_rotation || compression == DngCompression::Lossy {
+    // Rotation and lossy compression require demosaiced image data
+    OpcodeStage::List3
+  } else if apply_scaling {
+    OpcodeStage::List2
+  } else {
+    OpcodeStage::List1
+  }
+}
+
+/// Decide which opcode lists are applied to the image data, returns the processing
+/// stage of the image data written to DNG and the lists to apply.
+///
+/// `present` are the opcode lists of the image. A list in `needs` can't be stored with
+/// the maximum DNGBackwardVersion, `apply` are the lists requested by the user and
+/// `required` is the minimum stage of the image data. An opcode list is applied as a
+/// whole, as the opcodes may depend on each other. Lists of earlier stages are applied
+/// as well, because a DNG reader would apply them to image data of the wrong stage.
+fn processing_plan(present: [bool; 3], needs: [bool; 3], apply: ApplyDngOpcodes, required: OpcodeStage) -> (OpcodeStage, [bool; 3]) {
+  let processed: [bool; 3] = std::array::from_fn(|i| needs[i] || (present[i] && apply.includes(STAGES[i])));
+  let data_stage = STAGES
+    .into_iter()
+    .zip(processed)
+    .filter_map(|(stage, processed)| processed.then_some(stage))
+    .fold(required, Ord::max);
+  let applied = std::array::from_fn(|i| present[i] && (STAGES[i] < data_stage || (STAGES[i] == data_stage && processed[i])));
+  (data_stage, applied)
+}
+
+/// Demosaic scaled CFA image data into LinearRaw data, cropped to the active area,
+/// see [`render_linear_raw`]. Other image data is left unchanged, as stage 3 equals
+/// stage 2 for it.
+///
+/// Three-color sensors result in three planes, four-color sensors in four planes.
+/// The CFA data is demosaiced white balanced, the white balance is divided out
+/// again, as DNG readers apply it.
+fn demosaic_to_linear_raw(rawimage: RawImage, fuji_rotation: bool) -> crate::Result<RawImage> {
+  use ProcessingStep::*;
+  let mut steps: StepSet = [Demosaic, CropActiveArea, WhiteBalance].into_iter().collect();
+  if fuji_rotation {
+    steps.insert(FujiRotate);
+  }
+  render_linear_raw(rawimage, &RenderOptions { steps, ..Default::default() })
+}
+
+/// Reduce demosaiced four-color image data to three color planes.
+///
+/// The planes are mapped by a 3x4 reduction matrix R and the color matrices of all
+/// camera profiles are replaced by R·AB·CC·CM, so the analog balance and camera
+/// calibration become part of the color matrices. This is what a DNG reader does
+/// with a ReductionMatrix, but applied to the image data, so the DNG has three color
+/// planes and no ReductionMatrix. The image data can only be reduced once, so the
+/// reduction matrix of the as-shot profile for D65 is preferred, see
+/// [`CameraProfile::reduction_matrices`](crate::camera_profile::CameraProfile::reduction_matrices).
+fn reduce_to_three_planes(rawimage: &mut RawImage) -> crate::Result<()> {
+  let no_matrix = || RawlerError::DecoderFailed("Reducing four color planes requires a color matrix".into());
+  let profile = rawimage.as_shot_camera_profile().ok_or_else(no_matrix)?;
+  let reductions = profile.reduction_matrices();
+  let (illuminant, matrix) = profile
+    .slots()
+    .filter_map(|slot| Some((profile.illuminant(slot), reductions[slot].clone()?)))
+    .min_by_key(|(illuminant, _)| d65_preference(illuminant))
+    .ok_or_else(no_matrix)?;
+  let reduction = transform_1d::<3, 4>(&matrix).expect("reduction matrix has 12 values");
+  log::debug!("Reduce four color planes by {:?}, the reduction matrix for {:?}", reduction, illuminant);
+
+  let pixels = Color2D::<f32, 4>::new_with(rawimage.data.as_f32().as_chunks::<4>().0.to_vec(), rawimage.width, rawimage.height);
+  rawimage.data = RawImageData::Float(map_4ch_to_3ch(&pixels, &reduction).into_flatten());
+
+  let analog_balance = rawimage.analog_balance.take().and_then(|balance| {
+    let balance: [f32; 4] = balance.try_into().ok()?;
+    Some(std::array::from_fn::<_, 4, _>(|i| {
+      std::array::from_fn::<_, 4, _>(|j| if i == j { balance[i] } else { 0.0 })
+    }))
+  });
+  let calibration = std::mem::take(&mut rawimage.camera_calibration);
+  for profile in &mut rawimage.camera_profiles {
+    let calibration = Some(&calibration).filter(|calibration| calibration.applies_to(profile));
+    for slot in 0..CALIBRATION_SLOTS {
+      if let Some(matrix) = profile.color_matrix[slot].take() {
+        let Some(mut xyz2cam) = transform_1d::<4, 3>(&matrix) else {
+          log::warn!(
+            "Color matrix for {:?} has {} values, can't reduce it to three color planes",
+            profile.illuminant(slot),
+            matrix.len()
+          );
+          continue;
+        };
+        if let Some(cc) = calibration
+          .and_then(|calibration| calibration.matrices[slot].as_deref())
+          .and_then(transform_1d::<4, 4>)
+        {
+          xyz2cam = multiply(&cc, &xyz2cam);
+        }
+        if let Some(ab) = &analog_balance {
+          xyz2cam = multiply(ab, &xyz2cam);
+        }
+        profile.color_matrix[slot] = Some(transform_2d(&multiply(&reduction, &xyz2cam)));
+      }
+      // ForwardMatrix maps four color planes, ReductionMatrix is only allowed for more than three
+      profile.forward_matrix[slot] = None;
+      profile.reduction_matrix[slot] = None;
+    }
+  }
+  rawimage.camera_profiles.retain(|profile| profile.slots().next().is_some());
+
+  // Camera neutral in the reduced color space
+  let wb = rawimage.wb_coeffs;
+  rawimage.wb_coeffs = [f32::NAN; 4];
+  if !wb[0].is_nan() {
+    let neutral = reduction.map(|row| row.iter().zip(wb).map(|(r, wb)| r / wb).sum::<f32>());
+    let max = neutral.iter().copied().fold(f32::MIN, f32::max);
+    if neutral.iter().all(|n| *n > 0.0) {
+      rawimage.wb_coeffs = [max / neutral[0], max / neutral[1], max / neutral[2], f32::NAN];
+    } else {
+      log::warn!(
+        "Camera neutral {:?} is invalid after reducing the color planes, white balance is dropped",
+        neutral
+      );
+    }
+  }
+
+  rawimage.cpp = 3;
+  rawimage.blacklevel = BlackLevel::zero(1, 1, 3);
+  rawimage.whitelevel = WhiteLevel::new(vec![1; 3]);
+  Ok(())
+}
+
+/// Get a preview image from the decoder, or develop it from raw data.
+///
+/// If `force_develop` is set, embedded previews are ignored.
+fn generate_preview(
+  rawfile: &RawSource,
+  decoder: &dyn Decoder,
+  rawimage: &RawImage,
+  params: &RawDecodeParams,
+  force_develop: bool,
+) -> crate::Result<DynamicImage> {
+  let embedded = if force_develop { None } else { decoder.preview_image(rawfile, params)? };
+  match embedded {
+    Some(image) => Ok(image),
+    None => {
+      if force_develop {
+        log::debug!("Generate sRGB preview from RAW");
+      } else {
+        log::warn!("Preview image not found, try to generate sRGB from RAW");
+      }
+      // Previews are small, a demosaic of half size is enough
+      let options = RenderOptions {
+        demosaic: DemosaicQuality::Preview,
+        ..Default::default()
+      };
+      let image = render(rawimage.clone(), &options)?;
+      Ok(image.to_dynamic_image().ok_or("failed to convert to dynamic image")?)
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{decoders::Camera, imgop::xyz::Illuminant, pixarray::PixU16};
+
+  #[test]
+  fn required_stage_for_compression() {
+    use DngCompression as C;
+    use OpcodeStage as S;
+    assert_eq!(required_stage(false, false, C::Lossless), S::List1);
+    assert_eq!(required_stage(false, true, C::Uncompressed), S::List2);
+    assert_eq!(required_stage(true, false, C::Lossless), S::List3);
+    // Lossy compression requires demosaiced data
+    assert_eq!(required_stage(false, false, C::Lossy), S::List3);
+    assert_eq!(required_stage(false, true, C::Lossy), S::List3);
+  }
+
+  #[test]
+  fn demosaic_by_sensor_type() -> crate::Result<()> {
+    use crate::{
+      cfa::{CFA, PlaneColor},
+      rawimage::CFAConfig,
+    };
+
+    const XTRANS: &str = "GGRGGBGGBGGRBRGRBGGGBGGRGGRGGBRBGBRG";
+    for (pattern, colors, cpp) in [("RGGB", "RGB", 3), (XTRANS, "RGB", 3), ("CYGM", "CYGM", 4)] {
+      let mut camera = Camera::new();
+      camera.cfa = CFA::new(pattern);
+      camera.plane_color = PlaneColor::new(colors);
+      let photometric = RawPhotometricInterpretation::Cfa(CFAConfig::new_from_camera(&camera));
+      let mut rawimage = RawImage::new(
+        camera,
+        PixU16::new_with(vec![0; 24 * 24], 24, 24),
+        1,
+        [1.0, 1.0, 1.0, 1.0],
+        photometric,
+        Some(BlackLevel::zero(1, 1, 1)),
+        Some(WhiteLevel::new(vec![1])),
+        false,
+      );
+      rawimage.data = RawImageData::Float(vec![0.5; 24 * 24]);
+
+      let rawimage = demosaic_to_linear_raw(rawimage, false)?;
+
+      assert_eq!(rawimage.cpp, cpp, "{}", pattern);
+      assert_eq!(rawimage.photometric, RawPhotometricInterpretation::LinearRaw);
+      assert_eq!(rawimage.whitelevel.0, vec![1; cpp]);
+      let data = rawimage.data.as_f32();
+      assert_eq!(data.len(), 24 * 24 * cpp);
+      // A flat field stays flat
+      let center = (12 * 24 + 12) * cpp;
+      assert!(
+        data[center..center + cpp].iter().all(|v| (v - 0.5).abs() < 1e-3),
+        "{}: {:?}",
+        pattern,
+        &data[center..center + cpp]
+      );
+    }
+    Ok(())
+  }
+
+  /// Float CFA image of 24x24 pixels with `wb_coeffs`, `value` of each pixel by position and color
+  fn float_cfa_image(pattern: &str, colors: &str, wb_coeffs: [f32; 4], value: impl Fn(usize, usize, usize) -> f32) -> RawImage {
+    use crate::{
+      cfa::{CFA, PlaneColor},
+      rawimage::CFAConfig,
+    };
+
+    let mut camera = Camera::new();
+    camera.cfa = CFA::new(pattern);
+    camera.plane_color = PlaneColor::new(colors);
+    let photometric = RawPhotometricInterpretation::Cfa(CFAConfig::new_from_camera(&camera));
+    let data = (0..24 * 24)
+      .map(|i| {
+        let (x, y) = (i % 24, i / 24);
+        let plane = camera.plane_color.plane_lookup_table()[camera.cfa.color_at(y, x)];
+        value(x, y, plane)
+      })
+      .collect();
+    let mut rawimage = RawImage::new(
+      camera,
+      PixU16::new_with(vec![0; 24 * 24], 24, 24),
+      1,
+      wb_coeffs,
+      photometric,
+      Some(BlackLevel::zero(1, 1, 1)),
+      Some(WhiteLevel::new(vec![1])),
+      false,
+    );
+    rawimage.data = RawImageData::Float(data);
+    rawimage
+  }
+
+  #[test]
+  fn demosaic_to_linear_raw_divides_white_balance_out() -> crate::Result<()> {
+    // A flat field keeps its values in each plane, the white balance is not part of the data
+    const XTRANS: &str = "GGRGGBGGBGGRBRGRBGGGBGGRGGRGGBRBGBRG";
+    for (pattern, colors, wb) in [
+      ("RGGB", "RGB", [2.0, 1.0, 1.5, f32::NAN]),
+      (XTRANS, "RGB", [2.0, 1.0, 1.5, f32::NAN]),
+      ("CYGM", "CYGM", [1.5, 1.2, 1.0, 1.4]),
+    ] {
+      let rawimage = float_cfa_image(pattern, colors, wb, |_, _, plane| 0.4 / wb[plane]);
+      let rawimage = demosaic_to_linear_raw(rawimage, false)?;
+      let cpp = rawimage.cpp;
+      let center = (12 * 24 + 12) * cpp;
+      let pixel = &rawimage.data.as_f32()[center..center + cpp];
+      assert!(pixel.iter().zip(wb).all(|(v, wb)| (v - 0.4 / wb).abs() < 1e-5), "{}: {:?}", pattern, pixel);
+    }
+
+    // A neutral edge stays neutral when the data is demosaiced white balanced
+    let wb = [2.0, 1.0, 1.5, f32::NAN];
+    let gray = |x: usize| if x < 12 { 0.45 } else { 0.1 };
+    let error = |wb_coeffs: [f32; 4]| -> crate::Result<f32> {
+      let rawimage = float_cfa_image("RGGB", "RGB", wb_coeffs, |x, _, plane| gray(x) / wb[plane]);
+      let rawimage = demosaic_to_linear_raw(rawimage, false)?;
+      let data = rawimage.data.as_f32();
+      Ok(
+        (4..20)
+          .flat_map(|y| (4..20).flat_map(move |x| (0..3).map(move |c| (x, y, c))))
+          .map(|(x, y, c)| (data[(y * 24 + x) * 3 + c] * wb[c] - gray(x)).abs())
+          .fold(0.0, f32::max),
+      )
+    };
+    let balanced = error(wb)?;
+    let unbalanced = error([f32::NAN; 4])?;
+    assert!(balanced < 1e-3 && unbalanced > 0.01, "balanced {} unbalanced {}", balanced, unbalanced);
+    Ok(())
+  }
+
+  /// Demosaiced CYGM image with white and a saturated color, with color matrices for D65 and A
+  fn four_plane_image() -> RawImage {
+    // cyan = G + B, yellow = R + G, green = G, magenta = R + B
+    let rgb2cam = [[0.0, 1.0, 1.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1.0]];
+    let xyz2cam = transform_2d(&multiply(&rgb2cam, &crate::imgop::xyz::XYZ_TO_SRGB_D65));
+    let mut camera = Camera::new();
+    camera.color_matrix.insert(Illuminant::D65, xyz2cam.clone());
+    camera.color_matrix.insert(Illuminant::A, xyz2cam.iter().map(|v| v * 1.1).collect());
+    let mut rawimage = RawImage::new(
+      camera,
+      PixU16::new_with(vec![0; 2 * 4], 2 * 4, 1),
+      4,
+      // Camera neutral of D65 is (1, 1, 0.5, 1)
+      [1.0, 1.0, 2.0, 1.0],
+      RawPhotometricInterpretation::LinearRaw,
+      Some(BlackLevel::zero(1, 1, 4)),
+      Some(WhiteLevel::new(vec![1; 4])),
+      false,
+    );
+    rawimage.data = RawImageData::Float(vec![1.0, 1.0, 1.0, 1.0, 0.8, 0.2, 0.1, 0.4]);
+    rawimage
+  }
+
+  /// Color matrix of `illuminant` in the primary profile
+  fn color_matrix(rawimage: &RawImage, illuminant: Illuminant) -> Vec<f32> {
+    let profile = rawimage.primary_camera_profile().expect("profile");
+    profile
+      .slot_of(illuminant)
+      .and_then(|slot| profile.color_matrix[slot].clone())
+      .expect("color matrix")
+  }
+
+  #[test]
+  fn reduce_four_planes_to_three() -> crate::Result<()> {
+    let mut rawimage = four_plane_image();
+
+    reduce_to_three_planes(&mut rawimage)?;
+
+    assert_eq!(rawimage.cpp, 3);
+    assert_eq!(rawimage.whitelevel.0, vec![1; 3]);
+    let data = rawimage.data.as_f32();
+    assert_eq!(data.len(), 2 * 3);
+    // Camera white stays white, colors stay in range
+    assert!(data[..3].iter().all(|v| (v - 1.0).abs() < 1e-4), "white is {:?}", &data[..3]);
+    assert!(data.iter().all(|v| (0.0..=1.0 + 1e-6).contains(v)), "data is {:?}", data);
+    let profile = rawimage.primary_camera_profile().expect("profile");
+    assert_eq!(profile.slots().count(), 2);
+    assert!(
+      profile
+        .slots()
+        .all(|slot| profile.color_matrix[slot].as_ref().is_some_and(|matrix| matrix.len() == 9))
+    );
+    // The neutral is mapped into the reduced planes and normalized to a maximum of 1.0
+    assert!(rawimage.wb_coeffs[3].is_nan());
+    let neutral: Vec<f32> = rawimage.wb_coeffs[..3].iter().map(|wb| 1.0 / wb).collect();
+    assert!(neutral.iter().all(|n| *n > 0.0 && *n <= 1.0 + 1e-6), "neutral is {:?}", neutral);
+    assert!(neutral.iter().any(|n| (n - 1.0).abs() < 1e-6), "neutral is {:?}", neutral);
+    Ok(())
+  }
+
+  #[test]
+  fn reduce_four_planes_by_camera_reduction_matrix() -> crate::Result<()> {
+    let mut rawimage = four_plane_image();
+    let xyz2cam_a = transform_1d::<4, 3>(&color_matrix(&rawimage, Illuminant::A)).expect("4x3 matrix");
+    // The matrix for D65 is preferred to reduce the image data
+    let provided = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 1.0, 0.0]];
+    let profile = rawimage.primary_camera_profile_mut().expect("profile");
+    let (slot_a, slot_d65) = (profile.slot_of(Illuminant::A).expect("A"), profile.slot_of(Illuminant::D65).expect("D65"));
+    profile.reduction_matrix[slot_d65] = Some(transform_2d(&provided));
+    profile.reduction_matrix[slot_a] = Some(vec![0.25; 12]);
+
+    reduce_to_three_planes(&mut rawimage)?;
+
+    let data = rawimage.data.as_f32();
+    let expected = [1.0, 1.0, 1.0, 0.8, 0.3, 0.1];
+    assert!(data.iter().zip(expected).all(|(v, e)| (v - e).abs() < 1e-6), "data is {:?}", data);
+    assert_eq!(color_matrix(&rawimage, Illuminant::A), transform_2d(&multiply(&provided, &xyz2cam_a)));
+    // Three color planes have no reduction matrix
+    assert!(rawimage.camera_profiles[0].reduction_matrix.iter().all(Option::is_none));
+    Ok(())
+  }
+
+  #[test]
+  fn reduce_four_planes_of_all_profiles_with_calibration() -> crate::Result<()> {
+    let mut rawimage = four_plane_image();
+    let profile = rawimage.camera_profiles[0].clone();
+    let slot_d65 = profile.slot_of(Illuminant::D65).expect("D65");
+    let xyz2cam = transform_1d::<4, 3>(&color_matrix(&rawimage, Illuminant::D65)).expect("4x3 matrix");
+    let provided = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.5], [0.0, 0.0, 1.0, 0.0]];
+    rawimage.camera_profiles[0].reduction_matrix[slot_d65] = Some(transform_2d(&provided));
+    rawimage.camera_profiles[0].forward_matrix[slot_d65] = Some(vec![0.25; 12]);
+    // Extra profile with another calibration signature
+    let mut extra = profile;
+    extra.name = Some("Extra".into());
+    extra.calibration_signature = Some("other".into());
+    rawimage.camera_profiles.push(extra);
+    let balance = [1.0, 2.0, 1.0, 1.0];
+    rawimage.analog_balance = Some(balance.to_vec());
+    let calibration = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.5, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    rawimage.camera_calibration.matrices[slot_d65] = Some(transform_2d(&calibration));
+
+    reduce_to_three_planes(&mut rawimage)?;
+
+    let ab = std::array::from_fn::<_, 4, _>(|i| std::array::from_fn::<_, 4, _>(|j| if i == j { balance[i] } else { 0.0 }));
+    // CameraCalibration applies to the primary profile only
+    let expected = multiply(&provided, &multiply(&ab, &multiply(&calibration, &xyz2cam)));
+    assert_eq!(rawimage.camera_profiles[0].color_matrix[slot_d65], Some(transform_2d(&expected)));
+    let expected = multiply(&provided, &multiply(&ab, &xyz2cam));
+    assert_eq!(rawimage.camera_profiles[1].color_matrix[slot_d65], Some(transform_2d(&expected)));
+    assert!(
+      rawimage
+        .camera_profiles
+        .iter()
+        .all(|profile| profile.forward_matrix.iter().all(Option::is_none))
+    );
+    assert_eq!(rawimage.analog_balance, None);
+    assert!(rawimage.camera_calibration.is_empty());
+    Ok(())
+  }
+
+  #[test]
+  fn reduce_four_planes_requires_color_matrix() {
+    let mut rawimage = RawImage::new(
+      Camera::new(),
+      PixU16::new_with(vec![0; 4], 4, 1),
+      4,
+      [1.0, 1.0, 1.0, 1.0],
+      RawPhotometricInterpretation::LinearRaw,
+      Some(BlackLevel::zero(1, 1, 4)),
+      Some(WhiteLevel::new(vec![1; 4])),
+      false,
+    );
+    rawimage.camera_profiles.clear();
+    assert!(reduce_to_three_planes(&mut rawimage).is_err());
+  }
+
+  #[test]
+  fn lossy_jxl_applies_opcode_list1() {
+    use ApplyDngOpcodes as A;
+    use OpcodeStage as S;
+    let lossless = ConvertParams::default().with_compression(DngCompression::JpegXl);
+    assert_eq!(lossless.effective_apply_dng_opcodes(), A::Auto);
+    let lossy = lossless.with_jxl_distance(1.0);
+    assert_eq!(lossy.effective_apply_dng_opcodes(), A::List1);
+    // OpcodeList2 and OpcodeList3 are written to the DNG
+    let plan = processing_plan([true; 3], [false; 3], lossy.effective_apply_dng_opcodes(), S::List1);
+    assert_eq!(plan, (S::List1, [true, false, false]));
+    // Explicit modes include OpcodeList1
+    assert_eq!(lossy.with_apply_dng_opcodes(A::List2).effective_apply_dng_opcodes(), A::List2);
+  }
+
+  #[test]
+  fn processing_plan_stages() {
+    use ApplyDngOpcodes as A;
+    use OpcodeStage as S;
+    const ALL: [bool; 3] = [true, true, true];
+    const NONE: [bool; 3] = [false, false, false];
+    let cases = [
+      // Lists are written as they are
+      (ALL, NONE, A::Auto, S::List1, (S::List1, NONE)),
+      // Lists requested by the user
+      (ALL, NONE, A::List1, S::List1, (S::List1, [true, false, false])),
+      (ALL, NONE, A::List2, S::List1, (S::List2, [true, true, false])),
+      (ALL, NONE, A::List3, S::List1, (S::List3, ALL)),
+      // The image data is only processed up to the last present list
+      ([true, false, false], NONE, A::List3, S::List1, (S::List1, [true, false, false])),
+      ([false, false, true], NONE, A::List2, S::List1, (S::List1, NONE)),
+      // A list that can't be stored is applied with all earlier lists
+      (ALL, [false, false, true], A::List1, S::List1, (S::List3, ALL)),
+      (ALL, [false, true, false], A::Auto, S::List1, (S::List2, [true, true, false])),
+      // Scaling applies OpcodeList1 and keeps OpcodeList2
+      (ALL, NONE, A::Auto, S::List2, (S::List2, [true, false, false])),
+      // Missing lists are not applied
+      ([false, true, false], [false, true, false], A::Auto, S::List1, (S::List2, [false, true, false])),
+    ];
+    for (present, needs, apply, required, expected) in cases {
+      assert_eq!(
+        processing_plan(present, needs, apply, required),
+        expected,
+        "present {:?}, needs {:?}, apply {:?}, required {:?}",
+        present,
+        needs,
+        apply,
+        required
+      );
+    }
+  }
+}

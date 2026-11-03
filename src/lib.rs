@@ -428,7 +428,7 @@ pub extern "C" fn rlc_abi_version() -> u32 {
 /// "rawler-capi <version> (rawler <commit>)", static string.
 #[unsafe(no_mangle)]
 pub extern "C" fn rlc_version() -> *const c_char {
-  static V: &str = concat!("rawler-capi ", env!("CARGO_PKG_VERSION"), " (rawler 1fcc4a5607591178d2b335845a7e5ee09f89a37f)\0");
+  static V: &str = concat!("rawler-capi ", env!("CARGO_PKG_VERSION"), " (rawler 1fcc4a5607591178d2b335845a7e5ee09f89a37f + rawler/AUXOUT-CHANGES.md)\0");
   V.as_ptr() as *const c_char
 }
 
