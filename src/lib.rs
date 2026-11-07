@@ -553,6 +553,9 @@ pub unsafe extern "C" fn rlc_decode(
     }
     unsafe { *out = std::ptr::null_mut() };
     file.decoder.check_supported().map_err(decode_err)?;
+    if header_only == 0 {
+      file.source.advise_full_read();
+    }
     // The decoder is not Sync (it holds Rc'd IFDs). `install` runs the closure on a
     // pool thread while this thread blocks, so there is no concurrent access.
     let job = AssertSend(file);

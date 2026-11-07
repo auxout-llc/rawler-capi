@@ -79,7 +79,7 @@ impl<'a> MrwDecoder<'a> {
     if let Some(makernotes) = ifd.get_entry_recursive(TiffCommonTag::Makernote) {
       debug_assert_eq!(makernotes.get_data()[0..3], [b'M', b'L', b'Y']);
       if makernotes.get_data().get(0..3) == Some(b"MLY") {
-        let mut buf = Cursor::new(rawfile.as_vec()?);
+        let mut buf = Cursor::new(rawfile.buf());
         let mut wb = [0_u16; 4];
         let mut cam_mul = [1_u16; 4];
 
@@ -148,8 +148,7 @@ impl<'a> MrwDecoder<'a> {
   }
 
   fn new_mrw(file: &RawSource, rawloader: &'a RawLoader) -> Result<MrwDecoder<'a>> {
-    let full = file.as_vec()?;
-    let buf = &full;
+    let buf = file.buf();
     let data_offset: usize = (BEu32(buf, 4) + 8) as usize;
     let mut raw_height: usize = 0;
     let mut raw_width: usize = 0;

@@ -79,7 +79,7 @@ impl<'a> Decoder for SrwDecoder<'a> {
     let offset = fetch_tiff_tag!(raw, TiffCommonTag::StripOffsets).force_usize(0);
     let compression = fetch_tiff_tag!(raw, TiffCommonTag::Compression).force_u32(0);
     let bits = fetch_tiff_tag!(raw, TiffCommonTag::BitsPerSample).force_u32(0);
-    let src = file.subview_until_eof_padded(offset as u64)?;
+    let src = file.subview_until_eof_padded(offset as u64, dummy)?;
 
     let image = match compression {
       32769 => match bits {

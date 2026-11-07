@@ -6,7 +6,7 @@ use crate::decompressors::ljpeg::LjpegDecompressor;
 use crate::decompressors::packed::*;
 
 pub fn decode_unwrapped(file: &RawSource) -> Result<RawImageData> {
-  let buffer = file.subview_until_eof_padded(0)?;
+  let buffer = file.subview_until_eof_padded(0, false)?;
 
   let decoder = LEu16(&buffer, 0);
   let width = LEu16(&buffer, 2) as usize;

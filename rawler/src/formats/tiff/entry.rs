@@ -62,6 +62,12 @@ impl<'a> RawEntry<'a> {
 // 0-1-2-3-4-5-6-7-8-9-10-11-12-13
 const DATASHIFTS: [u8; 14] = [0, 0, 0, 1, 2, 3, 0, 0, 1, 2, 3, 2, 3, 2];
 
+/// ExifIFD MakerNotes (auxout, see the TYPE_UNDEFINED arm of [`Entry::parse`]).
+const MAKER_NOTE_TAG: u16 = 0x927c;
+/// Above any maker note read as tags; the smallest Phase One file seen spans 6 MB.
+const LARGE_MAKER_NOTE_BYTES: usize = 4 * 1024 * 1024;
+const LARGE_MAKER_NOTE_HEAD_BYTES: usize = 4096;
+
 impl Entry {
   pub fn value_type(&self) -> u16 {
     self.value.value_type()
@@ -177,7 +183,10 @@ impl Entry {
         }
       }
       TYPE_UNDEFINED => {
-        let mut v = vec![0; count as usize];
+        // auxout: Phase One's maker note spans the image data (nearly the whole file), and
+        // its decoder reads it from the file. Keep the start, for the name that opens a maker note.
+        let held = if tag == MAKER_NOTE_TAG && bytesize > LARGE_MAKER_NOTE_BYTES { LARGE_MAKER_NOTE_HEAD_BYTES } else { count as usize };
+        let mut v = vec![0; held];
         reader.read_u8_into(&mut v)?;
         Entry {
           tag,
@@ -296,3 +305,47 @@ mod auxout_tests {
     assert!(parse(TYPE_LONG, 4).is_ok());
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::bits::Endian;
+  use std::io::Cursor;
+
+  fn parse_undefined(tag: u16, count: usize) -> Entry {
+    let mut file = vec![0u8; 12 + count];
+    file[..2].copy_from_slice(&tag.to_le_bytes());
+    file[2..4].copy_from_slice(&TYPE_UNDEFINED.to_le_bytes());
+    file[4..8].copy_from_slice(&(count as u32).to_le_bytes());
+    file[8..12].copy_from_slice(&12u32.to_le_bytes());
+    file[12..21].copy_from_slice(b"IIIICwaR\0");
+    let mut cursor = Cursor::new(file);
+    let mut reader = EndianReader::new(&mut cursor, Endian::Little);
+    reader.goto(2).unwrap();
+    Entry::parse(&mut reader, 0, 0, tag).unwrap()
+  }
+
+  #[test]
+  fn a_maker_note_spanning_the_image_keeps_only_its_start() {
+    let entry = parse_undefined(MAKER_NOTE_TAG, LARGE_MAKER_NOTE_BYTES + 1);
+    assert_eq!(entry.offset(), Some(12));
+    let Value::Undefined(held) = &entry.value else { panic!("not undefined") };
+    assert_eq!(held.len(), LARGE_MAKER_NOTE_HEAD_BYTES);
+    assert_eq!(&held[..8], b"IIIICwaR");
+  }
+
+  #[test]
+  fn a_maker_note_of_the_limit_is_read_whole() {
+    let entry = parse_undefined(MAKER_NOTE_TAG, LARGE_MAKER_NOTE_BYTES);
+    let Value::Undefined(held) = &entry.value else { panic!("not undefined") };
+    assert_eq!(held.len(), LARGE_MAKER_NOTE_BYTES);
+  }
+
+  #[test]
+  fn another_tag_of_that_size_is_read_whole() {
+    let entry = parse_undefined(0x9286, LARGE_MAKER_NOTE_BYTES + 1);
+    let Value::Undefined(held) = &entry.value else { panic!("not undefined") };
+    assert_eq!(held.len(), LARGE_MAKER_NOTE_BYTES + 1);
+  }
+}
+

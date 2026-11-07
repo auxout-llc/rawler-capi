@@ -301,7 +301,7 @@ impl<'a> Decoder for OrfDecoder<'a> {
       }
     } else {
       log::debug!("ORF: fallback to decode_compressed");
-      let src = file.subview_padded(offset as u64, size as u64)?;
+      let src = file.subview_padded(offset as u64, size as u64, dummy)?;
       OrfDecoder::decode_compressed(&src, width, height, bps, dummy)
     };
 

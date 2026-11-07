@@ -38,7 +38,7 @@ struct X3fImage {
 
 impl X3fFile {
   fn new(file: &RawSource) -> Result<X3fFile> {
-    let buf = file.as_vec()?;
+    let buf = file.buf();
     let offset = LEu32(&buf, buf.len() - 4) as usize;
     let data = &buf[offset..];
     let version = LEu32(data, 4);
@@ -103,7 +103,7 @@ impl<'a> X3fDecoder<'a> {
 
 impl<'a> Decoder for X3fDecoder<'a> {
   fn raw_image(&self, file: &RawSource, _params: &RawDecodeParams, dummy: bool) -> Result<RawImage> {
-    let buffer = file.as_vec()?;
+    let buffer = file.buf();
     let caminfo = self
       .dir
       .images

@@ -293,10 +293,10 @@ impl<'a> Decoder for RafDecoder<'a> {
     let offset = raw.base as u64 + fetch_tiff_tag!(raw, FujiIFD::StripOffsets).force_u64(0);
     let src = if raw.has_entry(FujiIFD::StripByteCounts) {
       let strip_count = fetch_tiff_tag!(raw, FujiIFD::StripByteCounts).force_u64(0);
-      file.subview_padded(offset, strip_count)?
+      file.subview_padded(offset, strip_count, dummy)?
     } else {
       // Some models like DBP don't have a byte count, so we read until EOF
-      file.subview_until_eof_padded(offset)?
+      file.subview_until_eof_padded(offset, dummy)?
     };
 
     log::debug!("BPS: {}, width: {}, height: {}, offset: {}", bps, width, height, offset);

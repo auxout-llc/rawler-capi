@@ -112,7 +112,7 @@ impl<'a> Decoder for KdcDecoder<'a> {
         }) if data[0].n == 243 => 2,
         _ => 3,
       };
-      let src = file.subview_until_eof_padded(off as u64)?;
+      let src = file.subview_until_eof_padded(off as u64, dummy)?;
       let image = crate::decompressors::radc::decompress(&src, width, height, cbpp, dummy)?;
       let cpp = 1;
       let whitelevel = Some(WhiteLevel::new(vec![white; cpp]));
