@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
   bits::Endian,
   formats::tiff::{Rational, SRational, TiffAscii, TiffError, Value, apply_corr, reader::ReadByteOrder},
+  tags::DngTag,
 };
 
 use super::{Result, reader::EndianReader};
@@ -62,11 +63,27 @@ impl<'a> RawEntry<'a> {
 // 0-1-2-3-4-5-6-7-8-9-10-11-12-13
 const DATASHIFTS: [u8; 14] = [0, 0, 0, 1, 2, 3, 0, 0, 1, 2, 3, 2, 3, 2];
 
-/// ExifIFD MakerNotes (auxout, see the TYPE_UNDEFINED arm of [`Entry::parse`]).
+/// ExifIFD MakerNotes (auxout, see [`held_elements`]).
 const MAKER_NOTE_TAG: u16 = 0x927c;
+/// The raw file embedded in a DNG (auxout, see [`held_elements`]).
+const ORIGINAL_RAW_FILE_DATA_TAG: u16 = DngTag::OriginalRawFileData as u16;
+/// The second embedded JPEG of an RW2 (auxout, see [`held_elements`]). Up to 8.6 MB seen.
+const PANASONIC_JPG_FROM_RAW2_TAG: u16 = 0x0127;
 /// Above any maker note read as tags; the smallest Phase One file seen spans 6 MB.
 const LARGE_MAKER_NOTE_BYTES: usize = 4 * 1024 * 1024;
-const LARGE_MAKER_NOTE_HEAD_BYTES: usize = 4096;
+const HELD_HEAD_BYTES: usize = 4096;
+
+/// auxout: elements to read of a byte-sized value. Phase One's maker note spans the image data
+/// (nearly the whole file), and its decoder reads it from the file. No decoder reads an embedded
+/// raw file, as large as the original, or the JPEG of an RW2. Keep the start, for the name that
+/// opens a maker note.
+fn held_elements(tag: u16, count: usize) -> usize {
+  match tag {
+    MAKER_NOTE_TAG if count > LARGE_MAKER_NOTE_BYTES => HELD_HEAD_BYTES,
+    ORIGINAL_RAW_FILE_DATA_TAG | PANASONIC_JPG_FROM_RAW2_TAG => count.min(HELD_HEAD_BYTES),
+    _ => count,
+  }
+}
 
 impl Entry {
   pub fn value_type(&self) -> u16 {
@@ -124,7 +141,7 @@ impl Entry {
     }
     let entry = match typ {
       TYPE_BYTE => {
-        let mut v = vec![0; count as usize];
+        let mut v = vec![0; held_elements(tag, count as usize)];
         reader.read_u8_into(&mut v)?;
         Entry {
           tag,
@@ -183,10 +200,7 @@ impl Entry {
         }
       }
       TYPE_UNDEFINED => {
-        // auxout: Phase One's maker note spans the image data (nearly the whole file), and
-        // its decoder reads it from the file. Keep the start, for the name that opens a maker note.
-        let held = if tag == MAKER_NOTE_TAG && bytesize > LARGE_MAKER_NOTE_BYTES { LARGE_MAKER_NOTE_HEAD_BYTES } else { count as usize };
-        let mut v = vec![0; held];
+        let mut v = vec![0; held_elements(tag, count as usize)];
         reader.read_u8_into(&mut v)?;
         Entry {
           tag,
@@ -313,9 +327,13 @@ mod tests {
   use std::io::Cursor;
 
   fn parse_undefined(tag: u16, count: usize) -> Entry {
+    parse_typed(TYPE_UNDEFINED, tag, count)
+  }
+
+  fn parse_typed(typ: u16, tag: u16, count: usize) -> Entry {
     let mut file = vec![0u8; 12 + count];
     file[..2].copy_from_slice(&tag.to_le_bytes());
-    file[2..4].copy_from_slice(&TYPE_UNDEFINED.to_le_bytes());
+    file[2..4].copy_from_slice(&typ.to_le_bytes());
     file[4..8].copy_from_slice(&(count as u32).to_le_bytes());
     file[8..12].copy_from_slice(&12u32.to_le_bytes());
     file[12..21].copy_from_slice(b"IIIICwaR\0");
@@ -330,7 +348,7 @@ mod tests {
     let entry = parse_undefined(MAKER_NOTE_TAG, LARGE_MAKER_NOTE_BYTES + 1);
     assert_eq!(entry.offset(), Some(12));
     let Value::Undefined(held) = &entry.value else { panic!("not undefined") };
-    assert_eq!(held.len(), LARGE_MAKER_NOTE_HEAD_BYTES);
+    assert_eq!(held.len(), HELD_HEAD_BYTES);
     assert_eq!(&held[..8], b"IIIICwaR");
   }
 
@@ -339,6 +357,31 @@ mod tests {
     let entry = parse_undefined(MAKER_NOTE_TAG, LARGE_MAKER_NOTE_BYTES);
     let Value::Undefined(held) = &entry.value else { panic!("not undefined") };
     assert_eq!(held.len(), LARGE_MAKER_NOTE_BYTES);
+  }
+
+  #[test]
+  fn an_embedded_raw_file_keeps_only_its_start() {
+    let tag = ORIGINAL_RAW_FILE_DATA_TAG;
+    let Value::Undefined(held) = &parse_undefined(tag, 1024 * 1024).value else { panic!("not undefined") };
+    assert_eq!(held.len(), HELD_HEAD_BYTES);
+    let entry = parse_typed(TYPE_BYTE, tag, 1024 * 1024);
+    let Value::Byte(held) = &entry.value else { panic!("not bytes") };
+    assert_eq!(held.len(), HELD_HEAD_BYTES);
+    assert_eq!(entry.offset(), Some(12));
+  }
+
+  #[test]
+  fn an_embedded_value_shorter_than_the_head_is_read_whole() {
+    let entry = parse_typed(TYPE_BYTE, ORIGINAL_RAW_FILE_DATA_TAG, 100);
+    let Value::Byte(held) = &entry.value else { panic!("not bytes") };
+    assert_eq!(held.len(), 100);
+  }
+
+  #[test]
+  fn the_second_jpeg_of_an_rw2_keeps_only_its_start() {
+    let entry = parse_undefined(PANASONIC_JPG_FROM_RAW2_TAG, 1024 * 1024);
+    let Value::Undefined(held) = &entry.value else { panic!("not undefined") };
+    assert_eq!(held.len(), HELD_HEAD_BYTES);
   }
 
   #[test]
