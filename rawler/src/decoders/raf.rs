@@ -318,11 +318,11 @@ impl<'a> Decoder for RafDecoder<'a> {
       assert_eq!(bps, 16);
       dbp::decode_dbp(&src, width, height, dummy)?
     } else if src.len() < bps * width * height / 8 {
+      // Also for a header-only read: the `compressed` mode has another active area.
+      if let Some(cam_compr) = self.camera_compressed.clone() {
+        camera = cam_compr;
+      }
       if !dummy {
-        //if let Some(camera) = rawloader.check_supported(&ifd)
-        if let Some(cam_compr) = self.camera_compressed.clone() {
-          camera = cam_compr;
-        }
         decompress_fuji(&src, width, height, bps, &corrected_cfa)?
       } else {
         alloc_image_plain!(width, height, dummy)
