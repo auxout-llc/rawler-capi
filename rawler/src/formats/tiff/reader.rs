@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2021 Daniel Vogelbacher <daniel@chaospixel.com>
 
-use super::{Entry, IFD, Result, TiffError, apply_corr, entry::RawEntry, file::TiffFile};
+use super::{Entry, IFD, ReadBudget, Result, TiffError, apply_corr, entry::RawEntry, file::TiffFile};
 use crate::{
   bits::Endian,
   tags::{ExifTag, TiffCommonTag, TiffTag},
 };
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::{
+  collections::HashSet,
+  io::{Cursor, Read, Seek, SeekFrom},
+};
 
 pub trait TiffReader {
   fn file(&self) -> &TiffFile;
@@ -167,11 +170,20 @@ pub trait TiffReader {
 
     next_ifd = apply_corr(next_ifd, self.file().corr);
     let mut chain = Vec::new();
+    // auxout: one budget for the whole chain and its sub-IFDs, and the IFDs read so far. A chain
+    // that comes back to an IFD it has read ends there, like one that reaches `max_chained`:
+    // with `max_chained` at None it looped forever, allocating each round.
+    let mut budget = ReadBudget::new();
+    let mut visited = HashSet::new();
     while next_ifd != 0 {
+      if !visited.insert(next_ifd) {
+        log::warn!("TIFF: IFD chain comes back to offset {}. Ending the chain there.", next_ifd);
+        break;
+      }
       // TODO: check if offset is in range
       let mut multi_sub_tags = self.wellknown_sub_ifd_tags();
       multi_sub_tags.extend_from_slice(sub_tags);
-      let ifd = IFD::new(reader, next_ifd, self.file().base, self.file().corr, endian, &multi_sub_tags)?;
+      let ifd = IFD::new_budgeted(reader, next_ifd, self.file().base, self.file().corr, endian, &multi_sub_tags, &mut budget)?;
       if ifd.entries.is_empty() {
         return Err(TiffError::General("TIFF is invalid, IFD must contain at least one entry".to_string()));
       }
@@ -440,5 +452,169 @@ impl<'a, R: Read + Seek + 'a> ReadByteOrder for EndianReader<'a, R> {
       Endian::Little => self.inner.read_f64_into::<LittleEndian>(dst),
       Endian::Big => self.inner.read_f64_into::<BigEndian>(dst),
     }
+  }
+}
+
+// auxout: a chain that comes back to an IFD ends there, and one read holds at most
+// `READ_BUDGET_BYTES` however often the same bytes are referenced (see `ReadBudget`).
+#[cfg(test)]
+mod auxout_tests {
+  use super::super::{IFD, READ_BUDGET_BYTES, TiffError};
+  use super::*;
+
+  const TYPE_SHORT: u16 = 3;
+  const TYPE_LONG: u16 = 4;
+  const TYPE_UNDEFINED: u16 = 7;
+  const SUB_IFDS: u16 = 0x014a;
+
+  /// A little-endian TIFF built by offsets: the header points at the first IFD at 8.
+  struct Tiff(Vec<u8>);
+
+  impl Tiff {
+    fn new() -> Self {
+      let mut b = b"II*\0".to_vec();
+      b.extend_from_slice(&8u32.to_le_bytes());
+      Self(b)
+    }
+
+    fn pos(&self) -> u32 {
+      self.0.len() as u32
+    }
+
+    /// Appends an IFD of (tag, type, count, value or offset) entries and returns its offset.
+    fn ifd(&mut self, entries: &[(u16, u16, u32, u32)], next: u32) -> u32 {
+      let at = self.pos();
+      self.0.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+      for (tag, typ, count, value) in entries {
+        self.0.extend_from_slice(&tag.to_le_bytes());
+        self.0.extend_from_slice(&typ.to_le_bytes());
+        self.0.extend_from_slice(&count.to_le_bytes());
+        self.0.extend_from_slice(&value.to_le_bytes());
+      }
+      self.0.extend_from_slice(&next.to_le_bytes());
+      at
+    }
+
+    fn set_u32(&mut self, at: u32, v: u32) {
+      self.0[at as usize..at as usize + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Sets the value (or value offset) of entry `index` of the IFD at `ifd`.
+    fn set_entry_value(&mut self, ifd: u32, index: u32, v: u32) {
+      self.set_u32(ifd + 2 + 12 * index + 8, v);
+    }
+
+    /// The offset of the "next IFD" field of an IFD of `n` entries at `ifd`.
+    fn next_field(ifd: u32, n: usize) -> u32 {
+      ifd + 2 + 12 * n as u32
+    }
+
+    fn zeros(&mut self, len: usize) -> u32 {
+      let at = self.pos();
+      self.0.resize(self.0.len() + len, 0);
+      at
+    }
+
+    fn longs(&mut self, values: &[u32]) -> u32 {
+      let at = self.pos();
+      for v in values {
+        self.0.extend_from_slice(&v.to_le_bytes());
+      }
+      at
+    }
+
+    fn read(&self) -> Result<GenericTiffReader> {
+      GenericTiffReader::new(&mut Cursor::new(&self.0), 0, 0, None, &[])
+    }
+  }
+
+  const WIDTH: (u16, u16, u32, u32) = (0x0100, TYPE_SHORT, 1, 16);
+
+  #[test]
+  fn a_chain_that_points_at_itself_ends_after_one_ifd() {
+    let mut t = Tiff::new();
+    t.ifd(&[WIDTH], 8);
+    let reader = t.read().expect("read");
+    assert_eq!(reader.chains().len(), 1);
+  }
+
+  #[test]
+  fn two_ifds_that_point_at_each_other_end_after_two() {
+    let mut t = Tiff::new();
+    let a = t.ifd(&[WIDTH], 0);
+    let b = t.ifd(&[WIDTH], a);
+    t.set_u32(Tiff::next_field(a, 1), b);
+    let reader = t.read().expect("read");
+    assert_eq!(reader.chains().len(), 2);
+  }
+
+  #[test]
+  fn a_root_chain_without_a_limit_ends_at_a_loop() {
+    let mut t = Tiff::new();
+    t.ifd(&[WIDTH], 8);
+    let root = IFD::new_root_with_correction(&mut Cursor::new(&t.0), 0, 0, 0, 0, &[]).expect("read");
+    assert!(root.chain.is_empty());
+  }
+
+  #[test]
+  fn tags_referencing_one_region_fail_past_the_budget() {
+    // 40 tags of 8 MiB each over the same 8 MiB: 320 MiB held from an 8 MiB file
+    const REGION: u32 = 8 * 1024 * 1024;
+    let mut t = Tiff::new();
+    let n = 40;
+    let ifd_len = 2 + 12 * n + 4;
+    let region = 8 + ifd_len as u32;
+    let entries: Vec<_> = (0..n as u16).map(|i| (0x9000 + i, TYPE_UNDEFINED, REGION, region)).collect();
+    t.ifd(&entries, 0);
+    t.zeros(REGION as usize);
+    assert!(matches!(t.read(), Err(TiffError::ReadBudgetExceeded(_))));
+  }
+
+  #[test]
+  fn sub_ifds_referencing_one_ifd_fail_past_the_budget() {
+    // SubIFDs naming the same IFD of 16 tags over 2 MiB 16 times: 512 MiB
+    const REGION: u32 = 2 * 1024 * 1024;
+    let mut t = Tiff::new();
+    let root = t.ifd(&[WIDTH, (SUB_IFDS, TYPE_LONG, 16, 0)], 0);
+    let region = t.zeros(REGION as usize);
+    let entries: Vec<_> = (0..16u16).map(|i| (0x9000 + i, TYPE_UNDEFINED, REGION, region)).collect();
+    let sub = t.ifd(&entries, 0);
+    let offsets = t.longs(&[sub; 16]);
+    t.set_entry_value(root, 1, offsets);
+    assert!(matches!(t.read(), Err(TiffError::ReadBudgetExceeded(_))));
+  }
+
+  #[test]
+  fn sub_ifds_of_tags_without_values_fail_past_the_budget() {
+    // Each reference to an IFD of 4096 inline shorts costs its entries, not its values
+    let mut t = Tiff::new();
+    let refs = (READ_BUDGET_BYTES / (4096 * 64)) as u32 + 8;
+    let root = t.ifd(&[WIDTH, (SUB_IFDS, TYPE_LONG, refs, 0)], 0);
+    let entries: Vec<_> = (0..4096u16).map(|i| (i, TYPE_SHORT, 1, 1)).collect();
+    let sub = t.ifd(&entries, 0);
+    let offsets = t.longs(&vec![sub; refs as usize]);
+    t.set_entry_value(root, 1, offsets);
+    assert!(matches!(t.read(), Err(TiffError::ReadBudgetExceeded(_))));
+  }
+
+  #[test]
+  fn a_tiff_under_the_budget_reads_as_before() {
+    let mut t = Tiff::new();
+    let root = t.ifd(&[WIDTH, (SUB_IFDS, TYPE_LONG, 2, 0)], 0);
+    let sub = t.ifd(&[(0x0101, TYPE_SHORT, 1, 7)], 0);
+    let offsets = t.longs(&[sub, sub]);
+    t.set_entry_value(root, 1, offsets);
+    let reader = t.read().expect("read");
+    let subs = &reader.root_ifd().sub_ifds()[&SUB_IFDS];
+    assert_eq!(subs.len(), 2);
+    assert_eq!(subs[1].get_entry(0x0101u16).map(|e| e.force_u16(0)), Some(7));
+  }
+
+  #[test]
+  fn the_budget_runs_out_once_its_limit_is_spent() {
+    let mut budget = ReadBudget::with_limit(100);
+    assert!(budget.charge(60).is_ok());
+    assert!(budget.charge(40).is_ok());
+    assert!(matches!(budget.charge(1), Err(TiffError::ReadBudgetExceeded(_))));
   }
 }

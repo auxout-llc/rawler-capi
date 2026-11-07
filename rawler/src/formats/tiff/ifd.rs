@@ -2,7 +2,7 @@
 // Copyright 2021 Daniel Vogelbacher <daniel@chaospixel.com>
 
 use super::{
-  Entry, Result, TiffError, Value, apply_corr,
+  Entry, ReadBudget, Result, TiffError, Value, apply_corr,
   entry::RawEntry,
   read_from_file,
   reader::{EndianReader, ReadByteOrder},
@@ -16,11 +16,14 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::{
-  collections::{BTreeMap, HashMap},
+  collections::{BTreeMap, HashMap, HashSet},
   io::{Read, Seek, SeekFrom},
 };
 
 const MAX_IFD_ENTRIES: usize = 4096;
+/// auxout: what an IFD costs besides its entries. Charged so that many references to an empty
+/// IFD also run out of [`ReadBudget`].
+const IFD_FIXED_BYTES: u64 = 256;
 
 #[derive(Debug)]
 pub enum OffsetMode {
@@ -54,6 +57,22 @@ impl IFD {
   }
 
   pub fn new_root_with_correction<R: Read + Seek>(reader: &mut R, offset: u32, base: u32, corr: i32, max_chain: usize, sub_tags: &[u16]) -> Result<IFD> {
+    Self::new_root_with_correction_budgeted(reader, offset, base, corr, max_chain, sub_tags, &mut ReadBudget::new())
+  }
+
+  /// auxout: [`IFD::new_root_with_correction`] with one `budget` for the whole chain. A chain that
+  /// comes back to an IFD it has read ends there, like one that reaches `max_chain`. The loop below
+  /// applies `corr` to a `next_ifd` that already carries it (as upstream does), so with a non-zero
+  /// `corr` the offsets drift and only `max_chain` and the budget end a looping chain.
+  fn new_root_with_correction_budgeted<R: Read + Seek>(
+    reader: &mut R,
+    offset: u32,
+    base: u32,
+    corr: i32,
+    max_chain: usize,
+    sub_tags: &[u16],
+    budget: &mut ReadBudget,
+  ) -> Result<IFD> {
     reader.seek(SeekFrom::Start((base + offset) as u64))?;
     let endian = match reader.read_u16::<LittleEndian>()? {
       0x4949 => Endian::Little,
@@ -77,7 +96,8 @@ impl IFD {
     multi_sub_tags.extend_from_slice(sub_tags);
 
     next_ifd = apply_corr(next_ifd, corr);
-    let mut root = IFD::new(reader, next_ifd, base, corr, endian, &multi_sub_tags)?;
+    let mut visited = HashSet::from([next_ifd]);
+    let mut root = IFD::new_budgeted(reader, next_ifd, base, corr, endian, &multi_sub_tags, budget)?;
     if root.entries.is_empty() {
       return Err(TiffError::General("TIFF is invalid, IFD must contain at least one entry".to_string()));
     }
@@ -85,7 +105,11 @@ impl IFD {
 
     while next_ifd != 0 {
       next_ifd = apply_corr(next_ifd, corr);
-      let ifd = IFD::new(reader, next_ifd, base, corr, endian, &multi_sub_tags)?;
+      if !visited.insert(next_ifd) {
+        log::warn!("TIFF: IFD chain comes back to offset {}. Ending the chain there.", next_ifd);
+        break;
+      }
+      let ifd = IFD::new_budgeted(reader, next_ifd, base, corr, endian, &multi_sub_tags, budget)?;
       if ifd.entries.is_empty() {
         return Err(TiffError::General("TIFF is invalid, IFD must contain at least one entry".to_string()));
       }
@@ -101,6 +125,21 @@ impl IFD {
   }
 
   pub fn new<R: Read + Seek>(reader: &mut R, offset: u32, base: u32, corr: i32, endian: Endian, sub_tags: &[u16]) -> Result<IFD> {
+    Self::new_budgeted(reader, offset, base, corr, endian, sub_tags, &mut ReadBudget::new())
+  }
+
+  /// auxout: [`IFD::new`], charging the IFD, its entries and its sub-IFDs to `budget`. Running out
+  /// is returned from the loops that otherwise skip a broken tag or sub-IFD.
+  pub(crate) fn new_budgeted<R: Read + Seek>(
+    reader: &mut R,
+    offset: u32,
+    base: u32,
+    corr: i32,
+    endian: Endian,
+    sub_tags: &[u16],
+    budget: &mut ReadBudget,
+  ) -> Result<IFD> {
+    budget.charge(IFD_FIXED_BYTES)?;
     reader.seek(SeekFrom::Start((base + offset) as u64))?;
     let mut sub_ifd_offsets = HashMap::new();
     let mut reader = EndianReader::new(reader, endian);
@@ -144,7 +183,7 @@ impl IFD {
         }
       };
 
-      match Entry::parse(&mut reader, base, corr, tag) {
+      match Entry::parse_budgeted(&mut reader, base, corr, tag, budget) {
         Ok(entry) => {
           consecutive_errors = 0;
 
@@ -174,6 +213,7 @@ impl IFD {
           }
           entries.insert(entry.tag, entry);
         }
+        Err(err @ TiffError::ReadBudgetExceeded(_)) => return Err(err),
         Err(err) => {
           consecutive_errors += 1;
           log::warn!("Failed to parse TIFF tag 0x{:X} (Index {}). Error: {:?}", tag, i, err);
@@ -206,8 +246,9 @@ impl IFD {
     for subs in sub_ifd_offsets {
       let mut ifds = Vec::new();
       for offset in subs.1 {
-        match Self::new(reader, apply_corr(offset, corr), base, corr, endian, &[]) {
+        match Self::new_budgeted(reader, apply_corr(offset, corr), base, corr, endian, &[], budget) {
           Ok(ifd) => ifds.push(ifd),
+          Err(err @ TiffError::ReadBudgetExceeded(_)) => return Err(err),
           Err(err) => {
             log::warn!("Error while processing TIFF sub-IFD for tag 0x{:X}, ignoring it: {}", subs.0, err);
           }
@@ -294,8 +335,9 @@ impl IFD {
       let mut subs = Vec::new();
       match &entry.value {
         Value::Long(offsets) => {
+          let mut budget = ReadBudget::new();
           for off in offsets {
-            let ifd = Self::new_root_with_correction(reader, *off, self.base, self.corr, 10, &[])?;
+            let ifd = Self::new_root_with_correction_budgeted(reader, *off, self.base, self.corr, 10, &[], &mut budget)?;
             subs.push(ifd);
           }
           self.sub.insert(tag, subs);

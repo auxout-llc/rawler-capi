@@ -12,7 +12,7 @@ use crate::{
   tags::DngTag,
 };
 
-use super::{Result, reader::EndianReader};
+use super::{ReadBudget, Result, reader::EndianReader};
 
 const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
@@ -72,6 +72,9 @@ const PANASONIC_JPG_FROM_RAW2_TAG: u16 = 0x0127;
 /// Above any maker note read as tags; the smallest Phase One file seen spans 6 MB.
 const LARGE_MAKER_NOTE_BYTES: usize = 4 * 1024 * 1024;
 const HELD_HEAD_BYTES: usize = 4096;
+/// auxout: what an entry costs besides its values (the `Entry` and its place in the IFD's map).
+/// Charged so that repeating tags without values also runs out of [`ReadBudget`].
+pub(crate) const ENTRY_FIXED_BYTES: u64 = 64;
 
 /// auxout: elements to read of a byte-sized value. Phase One's maker note spans the image data
 /// (nearly the whole file), and its decoder reads it from the file. No decoder reads an embedded
@@ -102,6 +105,11 @@ impl Entry {
   }
 
   pub fn parse<R: Read + Seek>(reader: &mut EndianReader<R>, base: u32, corr: i32, tag: u16) -> Result<Entry> {
+    Self::parse_budgeted(reader, base, corr, tag, &mut ReadBudget::new())
+  }
+
+  /// auxout: [`Entry::parse`], charging what the entry will hold to `budget` before allocating.
+  pub(crate) fn parse_budgeted<R: Read + Seek>(reader: &mut EndianReader<R>, base: u32, corr: i32, tag: u16, budget: &mut ReadBudget) -> Result<Entry> {
     let pos = reader.position()? - 2; // TODO -2 because tag is already read
 
     let typ = reader.read_u16()?;
@@ -139,6 +147,11 @@ impl Entry {
         tag, bytesize, remaining
       )));
     }
+    let held_bytes = match typ {
+      TYPE_BYTE | TYPE_UNDEFINED => held_elements(tag, count as usize),
+      _ => bytesize,
+    };
+    budget.charge(ENTRY_FIXED_BYTES + held_bytes as u64)?;
     let entry = match typ {
       TYPE_BYTE => {
         let mut v = vec![0; held_elements(tag, count as usize)];

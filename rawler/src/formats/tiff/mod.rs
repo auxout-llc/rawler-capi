@@ -260,6 +260,11 @@ pub enum TiffError {
   #[error("Format mismatch: {}", _0)]
   FormatMismatch(String),
 
+  /// auxout: one read of a TIFF structure would hold more than [`READ_BUDGET_BYTES`].
+  /// Returned as is by the loops that skip a broken tag or sub-IFD (see [`ReadBudget`]).
+  #[error("Read budget exceeded: {}", _0)]
+  ReadBudgetExceeded(String),
+
   /// Error on internal cursor type
   #[error("I/O error: {:?}", _0)]
   Io(#[from] std::io::Error),
@@ -267,6 +272,54 @@ pub enum TiffError {
 
 /// Result type for Compressor results
 pub type Result<T> = std::result::Result<T, TiffError>;
+
+/// auxout: the most one read of a TIFF structure (the IFD chain and all its sub-IFDs) may hold.
+/// A constant, not a share of the file size: the same bytes can be referenced any number of times
+/// (tags pointing at one region, SubIFDs pointing at one IFD), so a bound proportional to the file
+/// grows with the file.
+pub const READ_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// auxout: what one read of a TIFF structure may still allocate. Shared by the whole chain and its
+/// sub-IFDs, and charged before the values of a tag are allocated. Running out is
+/// [`TiffError::ReadBudgetExceeded`], which the loops that skip a broken tag or sub-IFD return
+/// instead of skipping: skipping would let the next reference allocate again.
+#[derive(Debug)]
+pub struct ReadBudget {
+  limit: u64,
+  left: u64,
+}
+
+impl ReadBudget {
+  pub fn new() -> Self {
+    Self::with_limit(READ_BUDGET_BYTES)
+  }
+
+  pub fn with_limit(bytes: u64) -> Self {
+    Self { limit: bytes, left: bytes }
+  }
+
+  pub fn charge(&mut self, bytes: u64) -> Result<()> {
+    match self.left.checked_sub(bytes) {
+      Some(left) => {
+        self.left = left;
+        Ok(())
+      }
+      None => {
+        self.left = 0;
+        Err(TiffError::ReadBudgetExceeded(format!(
+          "{} more bytes would go over the limit of {} bytes",
+          bytes, self.limit
+        )))
+      }
+    }
+  }
+}
+
+impl Default for ReadBudget {
+  fn default() -> Self {
+    Self::new()
+  }
+}
 
 use crate::tags::{DngTag, ExifTag, TiffCommonTag};
 
