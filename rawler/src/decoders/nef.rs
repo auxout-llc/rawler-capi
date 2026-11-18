@@ -204,8 +204,12 @@ impl<'a> Decoder for NefDecoder<'a> {
     };
     debug!("TIFF compression flag: {}, NEF compression mode: {:?}", compression, nef_compression);
 
-    if matches!(nef_compression, Some(NefCompression::HighEfficency)) || matches!(nef_compression, Some(NefCompression::HighEfficencyStar)) {
-      return Err(RawlerError::DecoderFailed(format!("NEF compression {:?} is not supported", nef_compression)));
+    // AUXOUT: High Efficiency (TicoRAW) has no open decoder. Refuse only when the pixels are
+    // decoded, as unsupported rather than as a corrupt file: a header-only read never touches
+    // the pixels (the strip is tagged 34713 and `decode_compressed` returns before reading it),
+    // so sizes, levels and tags stay readable and the app can show the embedded JPEG.
+    if !dummy && matches!(nef_compression, Some(NefCompression::HighEfficency | NefCompression::HighEfficencyStar)) {
+      return Err(RawlerError::unsupported(camera, format!("NEF compression {:?} is not supported", nef_compression)));
     }
 
     let offset = fetch_tiff_tag!(raw, TiffCommonTag::StripOffsets).force_usize(0);
